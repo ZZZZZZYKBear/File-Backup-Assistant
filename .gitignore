@@ -1,0 +1,5 @@
+dist/
+test-results/
+preview-state/
+app-preview.png
+*.user

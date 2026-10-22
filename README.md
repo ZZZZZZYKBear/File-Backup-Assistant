@@ -1,0 +1,57 @@
+# 云笺备份 · GitHub Backup Assistant
+
+Windows 桌面及托盘应用。将一个或多个文件夹定时备份到 GitHub；默认目标为 `https://github.com/ZZZZZZYKBear/my-record.git`，每小时检查一次。内容未变化时，不创建提交、不推送。时间戳变化不会产生空备份。
+
+## 下载
+
+[下载 Windows 安装包 v1.0.0](releases/CloudBackupAssistant-1.0.0-Windows.zip)
+
+解压后直接运行同目录的 `GitHubBackupAssistant.exe`。安装包包含程序、运行配置、安装脚本和使用说明；不需要 Python、Node 或 Codex。
+
+## 使用
+
+发行包解压后运行 `GitHubBackupAssistant.exe`；从源码构建则运行 `dist/GitHubBackupAssistant.exe`。安装到当前用户并创建桌面、开始菜单快捷方式及登录自启，可在安装包目录或项目根目录运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+1. 点击“添加目录”，逐个添加需要备份的文件夹。可以随时勾选、停用或移除任务。
+2. 点击“登录 GitHub”，通过 Git Credential Manager 在浏览器完成登录。应用不要求你填写或保存 PAT。
+3. 点击“立即备份”完成第一份备份，也可等待计划检查。
+4. “设置”中可以更换仓库、调整间隔、编辑排除规则、关闭登录自启。
+
+关闭窗口只收起到系统托盘；退出应用请右键托盘图标选择“退出助手”。“暂停计划”只暂停自动检查，仍可手动立即备份。退出时若有操作正在执行，会等本轮完成。
+
+开机自启实际指当前用户登录 Windows 后以托盘方式启动；电脑关机、未登录或应用已退出期间不会执行。睡眠后若已到计划时间，唤醒后补跑一轮。
+
+## 备份布局与恢复
+
+每个任务有稳定编号，云端文件位于 `backups/<任务编号>/`。目录名称和空目录结构记录在 `backup-manifests/<任务编号>.json`，不上传本地绝对路径。目录名称单元格的提示会显示对应云端路径。
+
+文件删除会记录为新的 Git 提交，旧内容仍在历史中；移除一个备份任务不会删除云端现有备份。助手仅备份，不主动覆盖或恢复本地源文件。需要恢复时，可下载/克隆仓库，参照对应 manifest 的 name 找到原目录，将备份文件复制到你选择的恢复目录。空目录可根据 directories 清单重建。历史版本可在 GitHub 提交记录中查找。
+
+应用设置、日志和缓存保存在 `%LOCALAPPDATA%\GitHubBackupAssistant`。不要删除缓存中的待推送提交。推送失败后会保留提交，下一轮先补传；不会强制推送。远端发生内容冲突时会停止并提示，在“设置 → 处理远端备份冲突”可以保留本地恢复引用，再基于远端最新历史和当前源文件继续备份。恢复引用位于缓存仓库 `refs/backup-recovery/`，可通过 Git 查看。
+
+快照在完整复制后才应用到缓存，并以事务日志记录旧快照和索引。提交前失败会回滚；异常中断后下轮自动恢复。提交成功但推送失败时保留已生成提交。
+
+## 范围
+
+- 源目录只读，所有 Git 操作在应用独立缓存中执行。
+- `.git`、`.svn`、`.hg` 固定排除。默认还排除 node_modules、.venv、venv、__pycache__、临时文件等；普通排除规则可修改，按所有层级的名称匹配。
+- 不跟随文件符号链接、目录联接和其他重解析点。跳过数量会显示在运行结果中。
+- 疑似凭据文件/密钥内容、不可读取或持续变化的文件会使整轮快照停止，不把不完整快照显示为成功。可以将明确不需要备份的文件加入排除规则。排除项不会上传。
+- 单文件达到 100 MiB 时提前停止；首版未集成 Git LFS。
+- 使用文件内容判定版本，未保存的编辑器内容、ACL、所有者、NTFS 备用数据流及文件系统级一致性快照不在备份范围内。
+- 依赖 Git for Windows 和 .NET Framework 4.8（本机已具备），不依赖 Python、Node 或 Codex 运行。
+
+## 源码与验证
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+.\dist\BackupTests.exe .\test-results
+```
+
+集成测试仅使用隔离的本地 bare Git 仓库和假文件，不向目标 GitHub 仓库写测试数据。覆盖多目录、空目录、字节保留、无变化跳过、增删改、目录联接、文件占用、凭据拦截、大文件、提交失败回滚、中断恢复、补传、远端更新、冲突保留及恢复。
+
+主实现与集成为 Codex 完成，DeepSeek V4.1 Flash 参与架构和代码审查。
