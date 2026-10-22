@@ -4,7 +4,7 @@ Windows 桌面及托盘应用。将一个或多个文件夹定时备份到 GitHu
 
 ## 下载
 
-[下载 Windows 安装包 v1.1.0](releases/CloudBackupAssistant-1.1.0-Windows.zip)
+[下载 Windows 安装包 v1.1.1](releases/CloudBackupAssistant-1.1.1-Windows.zip)
 
 解压后直接运行同目录的 `GitHubBackupAssistant.exe`。安装包包含程序、运行配置、安装脚本和使用说明；不需要 Python、Node 或 Codex。
 
@@ -38,6 +38,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 应用设置、日志和缓存保存在 `%LOCALAPPDATA%\GitHubBackupAssistant`。不要删除缓存中的待推送提交。推送失败后会保留提交，下一轮先补传；不会强制推送。远端发生内容冲突时会停止并提示，在“设置 → 处理远端备份冲突”可以保留本地恢复引用，再基于远端最新历史和当前源文件继续备份。恢复引用位于缓存仓库 `refs/backup-recovery/`，可通过 Git 查看。
 
 快照在完整复制后才应用到缓存，并以事务日志记录旧快照和索引。提交前失败会回滚；异常中断后下轮自动恢复。提交成功但推送失败时保留已生成提交。
+
+配置优先使用同目录替换保存；Windows 文件重定向阻止替换时，会先保存恢复记录，再写回配置。中断后下次启动自动恢复未提交的旧配置，并保留原有加密属性及权限。旧的 `settings.json.previous` 只读或被占用时，不影响保存；无法轮换的恢复副本保留为 `settings.json.previous-<编号>`。如果当前配置本身无法写入，移除、添加和暂停操作会提示未保存，并保留原来的任务及计划。
 
 ## 范围
 

@@ -30,6 +30,45 @@ namespace CloudBackup {
                 Engine engine = new Engine(store) { AllowLocalRemoteForTests = true };
                 store.Save(settings); store.Save(settings);
                 Assert(store.Load().Folders.Count == 3 && File.Exists(store.Config + ".previous"), "Settings atomic replacement failed."); passed.Add("atomic settings persistence");
+                Store saveStore = new Store(Path.Combine(root, "save-regression"));
+                Settings saveSettings = new Settings(); saveStore.Save(saveSettings); saveStore.Save(saveSettings);
+                string previousConfig = saveStore.Config + ".previous";
+                File.SetAttributes(previousConfig, FileAttributes.ReadOnly);
+                saveSettings.Paused = true; saveStore.Save(saveSettings);
+                Assert(saveStore.Load().Paused && Directory.GetFiles(saveStore.Root, "settings.json.previous-*").Length > 0, "Read-only previous backup prevented saving or lost recovery copy.");
+                File.SetAttributes(previousConfig, FileAttributes.Normal);
+                using (FileStream heldPrevious = new FileStream(previousConfig, FileMode.Open, FileAccess.Read, FileShare.None)) {
+                    saveSettings.Paused = false; saveStore.Save(saveSettings);
+                    Assert(!saveStore.Load().Paused, "Locked previous backup prevented saving.");
+                }
+                string liveConfig = File.ReadAllText(saveStore.Config);
+                using (FileStream heldConfig = new FileStream(saveStore.Config, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                    saveSettings.Paused = true; bool saveBlocked = false;
+                    try { saveStore.Save(saveSettings); } catch (IOException) { saveBlocked = true; }
+                    Assert(saveBlocked && File.ReadAllText(saveStore.Config) == liveConfig, "Failed save damaged original settings.");
+                }
+                Assert(Directory.GetFiles(saveStore.Root, "*.tmp").Length == 0, "Failed save leaked a temporary config.");
+                passed.Add("read-only and locked previous backups cannot block settings; live-file failure preserves original");
+                saveStore.ForceJournalForTests = true; saveStore.Save(saveSettings);
+                Assert(saveStore.Load().Paused && !File.Exists(saveStore.Config + ".recovery"), "Journaled save did not commit.");
+                saveStore.SaveFaultForTests = delegate { throw new IOException("failure after live write"); };
+                saveSettings.Paused = false; bool journalBlocked = false;
+                try { saveStore.Save(saveSettings); } catch (IOException) { journalBlocked = true; }
+                Assert(journalBlocked && saveStore.Load().Paused, "Failed journaled save did not restore the old config.");
+                saveStore.SaveFaultForTests = null;
+                byte[] beforeInterruptedSave = File.ReadAllBytes(saveStore.Config);
+                File.WriteAllBytes(saveStore.Config + ".recovery", beforeInterruptedSave);
+                File.WriteAllText(saveStore.Config, "{incomplete");
+                Assert(new Store(saveStore.Root).Load().Paused && !File.Exists(saveStore.Config + ".recovery"), "Interrupted config save did not recover.");
+                File.WriteAllBytes(saveStore.Config + ".recovery", beforeInterruptedSave);
+                File.WriteAllText(saveStore.Config, Json.Write(saveSettings));
+                Assert(new Store(saveStore.Root).Load().Paused, "Crash before marker deletion incorrectly committed a new config.");
+                using (FileStream heldLive = new FileStream(saveStore.Config, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                    journalBlocked = false; try { saveStore.Save(saveSettings); } catch (IOException) { journalBlocked = true; }
+                    Assert(journalBlocked && File.Exists(saveStore.Config + ".recovery") && File.ReadAllBytes(saveStore.Config).SequenceEqual(beforeInterruptedSave), "Locked journaled save damaged live config or lost undo record.");
+                }
+                Assert(new Store(saveStore.Root).Load().Paused && !File.Exists(saveStore.Config + ".recovery"), "Deferred config recovery failed after unlock.");
+                passed.Add("redirected config saves commit safely, roll back failures and recover interrupted writes on restart");
                 Settings emptyOnly = settings.Copy(); emptyOnly.Folders = emptyOnly.Folders.Where(j => j.Source == empty).ToList();
                 Assert(engine.Backup(emptyOnly).Pushed, "First backup containing only empty directories failed."); passed.Add("empty remote with only empty source directories");
                 RunResult first = engine.Backup(settings);
@@ -195,6 +234,25 @@ namespace CloudBackup {
                     table.CancelEdit(); form.ForceExit();
                 }
                 passed.Add("editable cloud-name column saves valid input and blocks invalid input");
+                Store removeStore = new Store(Path.Combine(root, "remove-preview"));
+                using (MainForm form = new MainForm(removeStore, false, true)) {
+                    form.ShowInTaskbar = false; form.Opacity = 0; form.Show(); System.Windows.Forms.Application.DoEvents();
+                    var field = typeof(MainForm).GetField("settings", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var table = (System.Windows.Forms.DataGridView)typeof(MainForm).GetField("grid", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(form);
+                    Settings beforeRemove = (Settings)field.GetValue(form); removeStore.Save(beforeRemove);
+                    string removeId = beforeRemove.Folders[0].Id;
+                    using (FileStream heldConfig = new FileStream(removeStore.Config, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+                        Assert(!form.RemoveJobs(new[] { removeId }), "Removal reported success when config was locked.");
+                        Assert(((Settings)field.GetValue(form)).Folders.Count == 2 && table.Rows.Count == 2 && removeStore.Load().Folders.Count == 2, "Failed removal changed memory, grid or saved tasks.");
+                    }
+                    removeStore.Save(beforeRemove); File.SetAttributes(removeStore.Config + ".previous", FileAttributes.ReadOnly);
+                    Assert(form.RemoveJobs(new[] { removeId }), "Read-only previous backup blocked task removal.");
+                    Assert(((Settings)field.GetValue(form)).Folders.Count == 1 && table.Rows.Count == 1 && removeStore.Load().Folders.All(j => j.Id != removeId), "Successful removal did not persist across reload.");
+                    File.SetAttributes(removeStore.Config + ".previous", FileAttributes.Normal);
+                    Assert(form.RemoveJobs(((Settings)field.GetValue(form)).Folders.Select(j => j.Id).ToArray()) && table.Rows.Count == 0 && removeStore.Load().Folders.Count == 0, "Removing the last task failed.");
+                    form.ForceExit();
+                }
+                passed.Add("remove selected tasks preserves UI on failed save, succeeds with blocked backup and persists an empty list");
                 string report = Json.Write(new { success = true, passed = passed, root = root });
                 File.WriteAllText(Path.Combine(root, "result.json"), report, Encoding.UTF8); Console.WriteLine(report); return 0;
             } catch (Exception error) {

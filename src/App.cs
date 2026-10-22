@@ -136,7 +136,7 @@ namespace CloudBackup {
             toolbar.Controls.Add(ButtonText("移除选中", delegate { RemoveFolder(); }, false));
             toolbar.Controls.Add(ButtonText("立即备份", async delegate { await Backup(); }, false));
             pause.Text = "暂停计划"; pause.AutoSize = true; pause.MinimumSize = new Size(98, 35); pause.FlatStyle = FlatStyle.Flat; pause.BackColor = Color.White; pause.FlatAppearance.BorderColor = Color.FromArgb(218, 224, 234);
-            pause.Click += delegate { settings.Paused = !settings.Paused; store.Save(settings); RefreshHeader(); }; actions.Add(pause); toolbar.Controls.Add(pause);
+            pause.Click += delegate { TogglePause(); }; actions.Add(pause); toolbar.Controls.Add(pause);
             toolbar.Controls.Add(ButtonText("登录 GitHub", async delegate { await Background("请在浏览器中完成 GitHub 登录…", delegate { engine.Login(); return "GitHub 登录已完成，可点击立即备份。"; }); }, false));
             toolbar.Controls.Add(ButtonText("检查连接", async delegate { await Background("正在检查仓库连接…", delegate { engine.TestConnection(settings.Repository); return "仓库可访问。首次推送若需要认证，请点击“登录 GitHub”。"; }); }, false));
             layout.Controls.Add(toolbar, 0, 3);
@@ -206,7 +206,7 @@ namespace CloudBackup {
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("打开助手", null, delegate { Restore(); });
             menu.Items.Add("立即备份", null, async delegate { await Backup(); });
-            menu.Items.Add("暂停 / 继续计划", null, delegate { if (!busy) { settings.Paused = !settings.Paused; store.Save(settings); RefreshHeader(); } });
+            menu.Items.Add("暂停 / 继续计划", null, delegate { TogglePause(); });
             menu.Items.Add("打开日志", null, delegate { Directory.CreateDirectory(Path.GetDirectoryName(store.LogFile)); Open(Path.GetDirectoryName(store.LogFile)); });
             menu.Items.Add(new ToolStripSeparator()); menu.Items.Add("退出助手", null, delegate { Exit(); });
             tray.ContextMenuStrip = menu; tray.DoubleClick += delegate { Restore(); };
@@ -286,17 +286,39 @@ namespace CloudBackup {
                     Paths.Source(dialog.SelectedPath, store.Root);
                     if (settings.Folders.Any(j => Paths.Equal(j.Source, dialog.SelectedPath))) { MessageBox.Show("这个目录已在备份列表中。"); return; }
                     FolderJob added = new FolderJob { Name = Path.GetFileName(Paths.Full(dialog.SelectedPath)), Source = Paths.Full(dialog.SelectedPath) };
-                    added.GitHubName = CloudNames.Suggest(added.Name, added.Id, settings.Folders); settings.Folders.Add(added);
-                    store.Save(settings); RefreshGrid(); RefreshHeader(); Report("目录已添加，可点击“立即备份”，或等待下一次每小时检查。");
+                    added.GitHubName = CloudNames.Suggest(added.Name, added.Id, settings.Folders);
+                    Settings candidate = settings.Copy(); candidate.Folders.Add(added);
+                    if (SaveTaskSettings(candidate, "添加目录")) Report("目录已添加，可点击“立即备份”，或等待下一次每小时检查。");
                 } catch (Exception error) { MessageBox.Show(error.Message, "无法添加目录"); }
             }
         }
         void RemoveFolder() {
+            if (busy) return;
             if (!grid.EndEdit()) return;
             List<FolderJob> selected = grid.SelectedRows.Cast<DataGridViewRow>().Select(r => r.Tag as FolderJob).Where(j => j != null).ToList();
             if (selected.Count == 0) return;
             if (MessageBox.Show("移除选中的 " + selected.Count + " 个备份任务？\n本地源文件、云端现有备份和历史均保留。", "移除备份任务", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-            foreach (FolderJob job in selected) settings.Folders.Remove(job); store.Save(settings); RefreshGrid(); RefreshHeader();
+            RemoveJobs(selected.Select(j => j.Id));
+        }
+        bool SaveTaskSettings(Settings candidate, string action) {
+            try {
+                store.Save(candidate); settings = candidate; RefreshGrid(); RefreshHeader(); return true;
+            } catch (Exception error) {
+                string message = action + "未保存，原任务和计划保持不变：" + Store.Sanitize(error.Message);
+                Report(message); store.Log(message); return false;
+            }
+        }
+        internal bool RemoveJobs(IEnumerable<string> ids) {
+            if (busy) return false;
+            HashSet<string> selected = new HashSet<string>(ids);
+            Settings candidate = settings.Copy(); candidate.Folders.RemoveAll(j => selected.Contains(j.Id));
+            if (!SaveTaskSettings(candidate, "移除任务")) return false;
+            Report("任务已移除，本地文件和云端备份均保留。"); return true;
+        }
+        void TogglePause() {
+            if (busy || !grid.EndEdit()) return;
+            Settings candidate = settings.Copy(); candidate.Paused = !candidate.Paused;
+            SaveTaskSettings(candidate, "更改计划");
         }
         async void Preferences() {
             if (busy) return;

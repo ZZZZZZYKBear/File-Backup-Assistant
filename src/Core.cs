@@ -9,6 +9,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Web.Script.Serialization;
+using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace CloudBackup {
@@ -75,14 +76,29 @@ namespace CloudBackup {
         public static T Read<T>(string value) { return new JavaScriptSerializer { MaxJsonLength = 8388608 }.Deserialize<T>(value); }
     }
     public sealed class Store {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool MoveFileEx(string existing, string destination, uint flags);
         public readonly string Root;
         public string Config { get { return Path.Combine(Root, "settings.json"); } }
         public string LogFile { get { return Path.Combine(Root, "logs", "app.log"); } }
         readonly object gate = new object();
+        internal bool ForceJournalForTests;
+        internal Action SaveFaultForTests;
         public Store(string root) { Root = Path.GetFullPath(root); Directory.CreateDirectory(Root); }
         public Settings Load() {
-            if (!File.Exists(Config)) return new Settings();
-            Settings value = Json.Read<Settings>(File.ReadAllText(Config, Encoding.UTF8));
+            lock (gate) {
+                string recovery = Config + ".recovery";
+                if (File.Exists(recovery)) {
+                    byte[] original = File.ReadAllBytes(recovery);
+                    ParseSettings(Encoding.UTF8.GetString(original));
+                    WriteConfigBytes(Config, original);
+                    File.Delete(recovery);
+                }
+                return File.Exists(Config) ? ParseSettings(File.ReadAllText(Config, Encoding.UTF8)) : new Settings();
+            }
+        }
+        Settings ParseSettings(string text) {
+            Settings value = Json.Read<Settings>(text.TrimStart('\uFEFF'));
             if (value == null || value.Folders == null || value.IntervalMinutes < 5 || value.IntervalMinutes > 10080)
                 throw new InvalidDataException("设置文件无效，已保留原文件：" + Config);
             foreach (FolderJob job in value.Folders) {
@@ -91,12 +107,67 @@ namespace CloudBackup {
             CloudNames.ValidateJobs(value.Folders);
             return value;
         }
+        static void WriteConfigBytes(string path, byte[] bytes) {
+            // Acquire the exclusive handle before modifying any existing bytes.
+            using (FileStream file = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None)) {
+                file.Write(bytes, 0, bytes.Length); file.SetLength(bytes.Length); file.Flush(true);
+            }
+        }
+        void SaveWithRecovery(string temp, string backup) {
+            string recovery = Config + ".recovery";
+            byte[] original = File.ReadAllBytes(backup);
+            ParseSettings(Encoding.UTF8.GetString(original));
+            File.Copy(backup, recovery, false);
+            // The recovery file must be durable before touching the live file.
+            using (FileStream marker = new FileStream(recovery, FileMode.Open, FileAccess.Write, FileShare.None)) marker.Flush(true);
+            try {
+                WriteConfigBytes(Config, File.ReadAllBytes(temp));
+                if (SaveFaultForTests != null) SaveFaultForTests();
+                // Deleting this marker is the commit point. Until then a crash
+                // recovers the old settings, even if the new JSON is complete.
+                File.Delete(recovery);
+            } catch {
+                try { WriteConfigBytes(Config, original); File.Delete(recovery); }
+                catch (IOException) { } catch (UnauthorizedAccessException) { }
+                throw;
+            }
+        }
         public void Save(Settings settings) {
             lock (gate) {
-                string temp = Config + ".tmp";
-                File.WriteAllText(temp, Json.Write(settings), new UTF8Encoding(false));
-                if (File.Exists(Config)) File.Replace(temp, Config, Config + ".previous", true);
-                else File.Move(temp, Config);
+                if (File.Exists(Config + ".recovery")) throw new IOException("配置恢复尚未完成，请重启助手后重试；原配置已保留。");
+                string token = Guid.NewGuid().ToString("N");
+                string temp = Config + "." + token + ".tmp";
+                string backup = Config + ".previous-" + token;
+                try {
+                    File.WriteAllText(temp, Json.Write(settings), new UTF8Encoding(false));
+                    // Keep a recovery copy before a same-directory rename. Using
+                    // MoveFileEx avoids ReplaceFile's ACL/EFS metadata merge,
+                    // which can fail with ERROR_UNABLE_TO_REMOVE_REPLACED.
+                    bool exists = File.Exists(Config);
+                    if (exists) {
+                        File.Copy(Config, backup, false);
+                        File.SetAccessControl(temp, File.GetAccessControl(Config));
+                        if ((File.GetAttributes(Config) & FileAttributes.Encrypted) != 0 &&
+                            (File.GetAttributes(temp) & FileAttributes.Encrypted) == 0) File.Encrypt(temp);
+                    }
+                    if (ForceJournalForTests && exists) SaveWithRecovery(temp, backup);
+                    else if (!MoveFileEx(temp, Config, exists ? 0x1u | 0x8u : 0x8u)) {
+                        int code = Marshal.GetLastWin32Error();
+                        // Some Windows redirection layers treat a same-directory
+                        // rename as cross-volume. Preserve a durable undo record
+                        // rather than allowing a non-atomic copy-and-delete move.
+                        if (code == 17 && exists) SaveWithRecovery(temp, backup);
+                        else throw new IOException("无法保存配置：" + new System.ComponentModel.Win32Exception(code).Message, unchecked((int)(0x80070000u | (uint)code)));
+                    }
+                    if (File.Exists(backup)) {
+                        try { File.Copy(backup, Config + ".previous", true); File.Delete(backup); }
+                        catch (IOException) { } // Keep the uniquely named recovery copy.
+                        catch (UnauthorizedAccessException) { }
+                    }
+                } finally {
+                    try { if (File.Exists(temp)) File.Delete(temp); }
+                    catch (IOException) { } catch (UnauthorizedAccessException) { }
+                }
             }
         }
         public void Log(string message) {
