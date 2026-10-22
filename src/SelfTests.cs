@@ -119,19 +119,63 @@ namespace CloudBackup {
                 Assert(!engine.Backup(settings).Changed, "Recovery created an unnecessary commit."); passed.Add("interrupted snapshot transaction recovered on next run");
                 string cleanHead = git.Must(root, "--git-dir", remote, "rev-parse", "HEAD");
                 File.WriteAllText(Path.Combine(source, ".env"), "fake=value");
-                bool blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
-                Assert(blocked && git.Must(root, "--git-dir", remote, "rev-parse", "HEAD") == cleanHead, "Sensitive filename leaked."); File.Delete(Path.Combine(source, ".env"));
+                File.WriteAllText(Path.Combine(second, "healthy.txt"), "healthy-with-env");
+                RunResult partial = engine.Backup(settings);
+                files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                Assert(partial.Pushed && partial.JobWarnings[settings.Folders[0].Id] == 1 && !files.Contains("/.env") && files.Contains("/healthy.txt"), "Sensitive file blocked healthy files or leaked.");
+                Assert(partial.Message.Contains("跳过 1 项") && partial.Message.Contains("并非完整备份"), "Partial backup was not visibly reported.");
+                Assert(!engine.Backup(settings).Changed, "Repeated skipped file generated a new commit."); File.Delete(Path.Combine(source, ".env"));
                 File.WriteAllText(Path.Combine(source, "fake-key.txt"), "sk-" + new string('a', 40));
-                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
-                Assert(blocked, "Sensitive content was not blocked."); File.Delete(Path.Combine(source, "fake-key.txt")); passed.Add("sensitive filename and content blocking");
+                File.WriteAllText(Path.Combine(second, "healthy.txt"), "healthy-with-key"); partial = engine.Backup(settings);
+                files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                Assert(partial.Pushed && partial.JobWarnings[settings.Folders[0].Id] == 1 && !files.Contains("/fake-key.txt") && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[1].Target + "/healthy.txt") == "healthy-with-key", "Sensitive contents blocked other files or leaked.");
+                File.Delete(Path.Combine(source, "fake-key.txt")); passed.Add("sensitive filenames and contents skipped while healthy files push; repeated skips do not commit");
                 using (FileStream big = File.Create(Path.Combine(source, "too-big.bin"))) big.SetLength(100L * 1024 * 1024);
-                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
-                Assert(blocked, "Oversized file was not blocked."); File.Delete(Path.Combine(source, "too-big.bin")); passed.Add("100 MiB file blocking before commit");
+                File.WriteAllText(Path.Combine(second, "healthy.txt"), "healthy-with-big"); partial = engine.Backup(settings);
+                files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                Assert(partial.Pushed && partial.JobWarnings[settings.Folders[0].Id] == 1 && !files.Contains("/too-big.bin"), "Oversized file blocked backup or leaked."); File.Delete(Path.Combine(source, "too-big.bin")); passed.Add("100 MiB file skipped while other files push");
+                File.WriteAllText(Path.Combine(second, "new.txt"), "locked-new-version");
                 using (FileStream locked = new FileStream(Path.Combine(second, "new.txt"), FileMode.Open, FileAccess.Read, FileShare.None)) {
-                    blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
-                    Assert(blocked && git.Must(root, "--git-dir", remote, "rev-parse", "HEAD") == cleanHead, "Locked file produced a partial backup.");
+                    File.WriteAllText(Path.Combine(source, "中文.txt"), "healthy-with-lock"); partial = engine.Backup(settings);
+                    Assert(partial.Pushed && partial.JobWarnings[settings.Folders[1].Id] == 1 && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[1].Target + "/new.txt") == "new", "Locked file prevented healthy push or deleted previous backup.");
                 }
-                passed.Add("locked file prevents partial snapshot commit");
+                Assert(engine.Backup(settings).Pushed && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[1].Target + "/new.txt") == "locked-new-version", "Unlocked file was not retried.");
+                passed.Add("locked file skipped without deleting old backup; unlocked file retries next run");
+                File.WriteAllText(Path.Combine(source, "changing.txt"), "stable-old"); engine.Backup(settings);
+                engine.FaultForTests = delegate(string phase) { if (phase == "after-file-copy:changing.txt") File.SetLastWriteTimeUtc(Path.Combine(source, "changing.txt"), File.GetLastWriteTimeUtc(Path.Combine(source, "changing.txt")).AddSeconds(1)); };
+                File.WriteAllText(Path.Combine(source, "changing.txt"), "unstable-new"); File.WriteAllText(Path.Combine(second, "healthy.txt"), "healthy-with-changing");
+                partial = engine.Backup(settings); engine.FaultForTests = null;
+                Assert(partial.Pushed && partial.JobWarnings[settings.Folders[0].Id] == 1 && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[0].Target + "/changing.txt") == "stable-old", "Changing file stopped backup or lost previous snapshot.");
+                engine.Backup(settings); File.Delete(Path.Combine(source, "changing.txt")); engine.Backup(settings);
+                passed.Add("continuously changing file skipped with old version preserved");
+                cleanHead = git.Must(root, "--git-dir", remote, "rev-parse", "HEAD");
+                engine.FaultForTests = delegate(string phase) { if (phase == "before-file-write") throw new IOException("simulated stage disk failure"); };
+                bool blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; } finally { engine.FaultForTests = null; }
+                Assert(blocked && git.Must(root, "--git-dir", remote, "rev-parse", "HEAD") == cleanHead && git.Must(cache, "status", "--porcelain") == "", "Stage write failure was swallowed as a file skip.");
+                passed.Add("staging disk failures stop safely rather than creating a false partial success");
+                string unavailable = Path.Combine(source, "unavailable");
+                Directory.CreateDirectory(Path.Combine(unavailable, "empty", "nested"));
+                File.WriteAllText(Path.Combine(unavailable, "keep.txt"), "previous-safe");
+                File.WriteAllText(Path.Combine(unavailable, "drop.txt"), "excluded-later"); engine.Backup(settings);
+                string previousUnavailable = Path.Combine(cache, settings.Folders[0].Target.Replace('/', Path.DirectorySeparatorChar), "unavailable");
+                File.WriteAllText(Path.Combine(previousUnavailable, ".env"), "fake=not-a-real-secret");
+                git.Must(cache, "add", "-f", "--all"); git.Must(cache, "commit", "-m", "simulate existing sensitive remote file"); git.Must(cache, "push", "origin", "main");
+                var deniedAcl = Directory.GetAccessControl(unavailable);
+                var denyRule = new System.Security.AccessControl.FileSystemAccessRule(System.Security.Principal.WindowsIdentity.GetCurrent().User,
+                    System.Security.AccessControl.FileSystemRights.ListDirectory, System.Security.AccessControl.AccessControlType.Deny);
+                deniedAcl.AddAccessRule(denyRule);
+                string originalExclusions = settings.Exclusions; settings.Exclusions += ";drop.txt";
+                try {
+                    Directory.SetAccessControl(unavailable, deniedAcl);
+                    File.WriteAllText(Path.Combine(second, "healthy.txt"), "healthy-with-unreadable-directory"); partial = engine.Backup(settings);
+                    files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                    string preservedManifest = git.Must(root, "--git-dir", remote, "show", "HEAD:backup-manifests/" + settings.Folders[0].Id + ".json");
+                    Assert(partial.Pushed && partial.JobWarnings[settings.Folders[0].Id] == 1 && files.Contains("/unavailable/keep.txt") &&
+                        !files.Contains("/unavailable/drop.txt") && !files.Contains("/unavailable/.env") && preservedManifest.Contains("unavailable/empty/nested"),
+                        "Unreadable directory lost safe old files/empty dirs, revived excluded secrets, or blocked other files.");
+                } finally { deniedAcl.RemoveAccessRuleSpecific(denyRule); Directory.SetAccessControl(unavailable, deniedAcl); settings.Exclusions = originalExclusions; }
+                Paths.DeleteTree(unavailable, root); engine.Backup(settings);
+                passed.Add("unreadable directory preserves safe previous subtree and empty dirs while respecting current exclusions and credential checks");
                 bool moved = false; string offline = Path.Combine(root, "remote-offline.git");
                 File.WriteAllText(Path.Combine(second, "new.txt"), "pending-push");
                 engine.Progress = delegate(string message) { if (!moved && message.Contains("正在推送")) { Paths.Child(remote, root); Paths.Child(offline, root); Directory.Move(remote, offline); moved = true; } };
@@ -180,7 +224,7 @@ namespace CloudBackup {
                 Assert(engine.Backup(settings).Pushed, "Custom Chinese directory rename failed.");
                 files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
                 Assert(!files.Contains(oldPath + "/") && files.Contains(settings.Folders[0].Target + "/中文.txt"), "Old directory was duplicated instead of migrated.");
-                Assert(git.Must(root, "--git-dir", remote, "show", beforeRename + ":" + oldPath + "/中文.txt") == "transaction-content", "Rename lost old Git history.");
+                Assert(git.Must(root, "--git-dir", remote, "show", beforeRename + ":" + oldPath + "/中文.txt") == "healthy-with-lock", "Rename lost old Git history.");
                 store.Save(settings); Assert(store.Load().Folders[0].GitHubName == "工作文档 v1", "Custom directory name was not persisted.");
                 Assert(!engine.Backup(settings).Changed, "Repeated named backup created a commit.");
                 passed.Add("Chinese and spaced directory names + format1 migration + history + persistence");

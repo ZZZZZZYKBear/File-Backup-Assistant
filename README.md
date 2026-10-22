@@ -4,7 +4,7 @@ Windows 桌面及托盘应用。将一个或多个文件夹定时备份到 GitHu
 
 ## 下载
 
-[下载 Windows 安装包 v1.1.1](releases/CloudBackupAssistant-1.1.1-Windows.zip)
+[下载 Windows 安装包 v1.2.0](releases/CloudBackupAssistant-1.2.0-Windows.zip)
 
 解压后直接运行同目录的 `GitHubBackupAssistant.exe`。安装包包含程序、运行配置、安装脚本和使用说明；不需要 Python、Node 或 Codex。
 
@@ -46,8 +46,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 - 源目录只读，所有 Git 操作在应用独立缓存中执行。
 - `.git`、`.svn`、`.hg` 固定排除。默认还排除 node_modules、.venv、venv、__pycache__、临时文件等；普通排除规则可修改，按所有层级的名称匹配。
 - 不跟随文件符号链接、目录联接和其他重解析点。跳过数量会显示在运行结果中。
-- 疑似凭据文件/密钥内容、不可读取或持续变化的文件会使整轮快照停止，不把不完整快照显示为成功。可以将明确不需要备份的文件加入排除规则。排除项不会上传。
-- 单文件达到 100 MiB 时提前停止；首版未集成 Git LFS。
+- 疑似凭据文件/密钥内容和达到 100 MiB 的文件会单独跳过，其余文件继续备份；未集成 Git LFS。
+- 文件被占用、无法读取或持续变化时会跳过，并尽量保留云端上一份安全备份；下次检查会重试。目录无法读取时同样尽量保留旧子树和空目录记录，仍应用当前排除规则和敏感检查。被删除的文件正常同步删除。
+- 有文件跳过时，列表显示“跳过 N 项”，日志记录相对路径及原因，云端 manifest 的 skipped 列表也会记录。结果会明确提示并非完整备份。相同跳过记录不会反复生成空提交；可以在设置中排除明确不需要备份的文件。
+- 本地缓存/暂存磁盘写入失败、Git 冲突或网络推送失败仍会停止并报错，不会伪装成成功。
 - 使用文件内容判定版本，未保存的编辑器内容、ACL、所有者、NTFS 备用数据流及文件系统级一致性快照不在备份范围内。
 - 依赖 Git for Windows 和 .NET Framework 4.8（本机已具备），不依赖 Python、Node 或 Codex 运行。
 

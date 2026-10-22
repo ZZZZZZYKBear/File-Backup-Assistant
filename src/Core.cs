@@ -287,6 +287,18 @@ namespace CloudBackup {
     public sealed class Snapshot {
         public string Path; public long Bytes; public int Files; public int Skipped;
         public List<string> Directories = new List<string>();
+        public List<SkippedEntry> Warnings = new List<SkippedEntry>();
+        public List<string> KeepPrevious = new List<string>();
+    }
+    public sealed class SkippedEntry {
+        public string Path { get; set; }
+        public string Reason { get; set; }
+    }
+    sealed class FileRejectedException : IOException {
+        public FileRejectedException(string reason) : base(reason) { }
+    }
+    sealed class SourceUnavailableException : IOException {
+        public SourceUnavailableException() : base("无法读取、文件被占用或已被移走") { }
     }
     public sealed class SnapshotChange {
         public string Relative { get; set; }
@@ -304,6 +316,7 @@ namespace CloudBackup {
     }
     public sealed class RunResult {
         public bool Pushed; public bool Changed; public int Files; public int Skipped; public string Message;
+        public Dictionary<string, int> JobWarnings = new Dictionary<string, int>();
     }
     public sealed class Engine {
         readonly Store store; readonly Git git;
@@ -337,15 +350,15 @@ namespace CloudBackup {
             if ((!example && (name == ".env" || name.StartsWith(".env."))) ||
                 new[] { "id_rsa", "id_ed25519", "id_ecdsa", "credentials", "credentials.json" }.Contains(name) ||
                 new[] { ".pfx", ".p12", ".key", ".pem" }.Contains(Path.GetExtension(name)))
-                throw new IOException("发现可能包含凭据的文件，本轮未提交：" + relative + "。可在设置中将不需要备份的文件加入排除规则。");
+                throw new FileRejectedException("可能包含凭据的文件");
             FileInfo file = new FileInfo(path);
-            if (file.Length >= 100L * 1024 * 1024) throw new IOException("单文件达到 100 MiB，GitHub 普通仓库不接收：" + relative);
+            if (file.Length >= 100L * 1024 * 1024) throw new FileRejectedException("单文件达到 100 MiB");
             if (file.Length <= 2 * 1024 * 1024) {
                 byte[] bytes = File.ReadAllBytes(path);
                 if (!bytes.Contains((byte)0)) {
                     string text = Encoding.UTF8.GetString(bytes);
                     if (Regex.IsMatch(text, @"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9_]{20,}|\bgithub_pat_[A-Za-z0-9_]{25,}|\bsk-[A-Za-z0-9_-]{24,}"))
-                        throw new IOException("检测到疑似密钥内容，本轮未提交：" + relative);
+                        throw new FileRejectedException("检测到疑似密钥内容");
                 }
             }
         }
@@ -358,31 +371,61 @@ namespace CloudBackup {
             return snapshot;
         }
         void CaptureDirectory(string source, string target, string relative, string exclusions, Snapshot snapshot) {
-            if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0) { snapshot.Skipped++; return; }
+            string[] entries;
+            try {
+                if ((ReadSource(() => File.GetAttributes(source)) & FileAttributes.ReparsePoint) != 0) { snapshot.Skipped++; return; }
+                entries = ReadSource(() => Directory.GetFileSystemEntries(source));
+            } catch (SourceUnavailableException error) { SkipEntry(snapshot, relative, error.Message, true); return; }
             snapshot.Directories.Add(relative);
-            foreach (string entry in Directory.GetFileSystemEntries(source)) {
+            foreach (string entry in entries) {
                 string name = Path.GetFileName(entry), rel = relative == "" ? name : relative + "/" + name;
-                FileAttributes attributes = File.GetAttributes(entry);
-                if (Excluded(name, exclusions) || (attributes & FileAttributes.ReparsePoint) != 0) { snapshot.Skipped++; continue; }
+                if (Excluded(name, exclusions)) { snapshot.Skipped++; continue; }
+                FileAttributes attributes;
+                try { attributes = ReadSource(() => File.GetAttributes(entry)); }
+                catch (SourceUnavailableException error) { SkipEntry(snapshot, rel, error.Message, true); continue; }
+                if ((attributes & FileAttributes.ReparsePoint) != 0) { snapshot.Skipped++; continue; }
                 string dest = Path.Combine(target, name);
                 if ((attributes & FileAttributes.Directory) != 0) {
                     Directory.CreateDirectory(dest); CaptureDirectory(entry, dest, rel, exclusions, snapshot);
                 } else {
+                    try {
                     bool stable = false;
                     for (int retry = 0; retry < 3; retry++) {
-                        FileInfo before = new FileInfo(entry); long size = before.Length; DateTime time = before.LastWriteTimeUtc;
-                        if (size >= 100L * 1024 * 1024) throw new IOException("单文件达到 100 MiB：" + rel);
-                        using (FileStream input = new FileStream(entry, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                        using (FileStream output = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None)) input.CopyTo(output);
-                        FileInfo after = new FileInfo(entry);
-                        if (size == after.Length && time == after.LastWriteTimeUtc && new FileInfo(dest).Length == size) { stable = true; break; }
+                        var before = ReadSource(() => { FileInfo f = new FileInfo(entry); return Tuple.Create(f.Length, f.LastWriteTimeUtc); });
+                        long size = before.Item1; DateTime time = before.Item2;
+                        if (size >= 100L * 1024 * 1024) throw new FileRejectedException("单文件达到 100 MiB");
+                        if (FaultForTests != null) FaultForTests("before-file-write");
+                        using (FileStream input = ReadSource(() => new FileStream(entry, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)))
+                        using (FileStream output = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None)) {
+                            byte[] buffer = new byte[65536]; long copied = 0; int count;
+                            while ((count = ReadSource(() => input.Read(buffer, 0, buffer.Length))) > 0) {
+                                copied += count;
+                                if (copied >= 100L * 1024 * 1024) throw new FileRejectedException("单文件达到 100 MiB");
+                                output.Write(buffer, 0, count);
+                            }
+                        }
+                        if (FaultForTests != null) FaultForTests("after-file-copy:" + rel);
+                        var after = ReadSource(() => { FileInfo f = new FileInfo(entry); return Tuple.Create(f.Length, f.LastWriteTimeUtc); });
+                        if (size == after.Item1 && time == after.Item2 && new FileInfo(dest).Length == size) { stable = true; break; }
                         Thread.Sleep(100);
                     }
-                    if (!stable) throw new IOException("文件持续变化，无法完成一致复制：" + rel);
+                    if (!stable) { File.Delete(dest); SkipEntry(snapshot, rel, "文件持续变化，无法完成一致复制", true); continue; }
                     CheckSensitive(dest, rel);
                     snapshot.Files++; snapshot.Bytes += new FileInfo(dest).Length;
+                    } catch (FileRejectedException error) { if (File.Exists(dest)) File.Delete(dest); SkipEntry(snapshot, rel, error.Message, false); }
+                    catch (SourceUnavailableException error) { if (File.Exists(dest)) File.Delete(dest); SkipEntry(snapshot, rel, error.Message, true); }
                 }
             }
+        }
+        T ReadSource<T>(Func<T> read) {
+            try { return read(); }
+            catch (IOException) { throw new SourceUnavailableException(); }
+            catch (UnauthorizedAccessException) { throw new SourceUnavailableException(); }
+        }
+        void SkipEntry(Snapshot snapshot, string relative, string reason, bool keepPrevious) {
+            snapshot.Skipped++; snapshot.Warnings.Add(new SkippedEntry { Path = relative, Reason = reason });
+            if (keepPrevious) snapshot.KeepPrevious.Add(relative);
+            Report("已跳过：" + (relative == "" ? "整个目录" : relative) + "（" + reason + "）");
         }
         public string CacheFor(string remote) { return Path.Combine(store.Root, "repositories", Key(remote), "repo"); }
         void ConfigureCache(string repo) {
@@ -517,7 +560,48 @@ namespace CloudBackup {
             journal.Changes.Add(new SnapshotChange { Relative = relative, RestoreRelative = restore, Directory = directory, Incoming = incoming,
                 Old = Path.Combine(stage, "old-" + journal.Changes.Count), HadOld = directory ? Directory.Exists(target) : File.Exists(target) });
         }
-        SnapshotJournal PrepareJournal(string repo, string stage, List<FolderJob> jobs, List<Snapshot> snapshots) {
+        string SnapshotPath(string root, string relative) {
+            if (relative == "") return root;
+            if (Path.IsPathRooted(relative) || relative.Contains('\\') || relative.Split('/').Any(p => p == "" || p == "." || p == ".." || p.Contains(':')))
+                throw new IOException("备份清单包含无效相对路径。");
+            string path = Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(path, root); return path;
+        }
+        void PreserveEntry(string previous, string target, string relative, string exclusions, Snapshot snapshot) {
+            Paths.Child(previous, store.Root);
+            if (!File.Exists(previous) && !Directory.Exists(previous)) return;
+            if (relative.Split('/').Any(p => Excluded(p, exclusions))) return;
+            if ((File.GetAttributes(previous) & FileAttributes.ReparsePoint) != 0) return;
+            if (Directory.Exists(previous)) {
+                if (File.Exists(target)) return;
+                Directory.CreateDirectory(target); snapshot.Directories.Add(relative);
+                foreach (string child in Directory.GetFileSystemEntries(previous)) {
+                    string name = Path.GetFileName(child);
+                    PreserveEntry(child, Path.Combine(target, name), relative == "" ? name : relative + "/" + name, exclusions, snapshot);
+                }
+            } else if (!File.Exists(target) && !Directory.Exists(target)) {
+                try { CheckSensitive(previous, relative); } catch (FileRejectedException) { return; }
+                Directory.CreateDirectory(Path.GetDirectoryName(target)); File.Copy(previous, target, false);
+            }
+        }
+        void PreserveUnavailable(string repo, FolderJob job, Snapshot snapshot, string exclusions) {
+            if (snapshot.KeepPrevious.Count == 0) return;
+            string previousRoot = Path.Combine(repo, "backups", SavedRemoteDirectory(repo, job.Id)); Paths.Child(previousRoot, store.Root);
+            foreach (string relative in snapshot.KeepPrevious)
+                PreserveEntry(SnapshotPath(previousRoot, relative), SnapshotPath(snapshot.Path, relative), relative, exclusions, snapshot);
+            string manifestPath = Path.Combine(repo, "backup-manifests", job.Id + ".json");
+            if (!File.Exists(manifestPath)) return;
+            var manifest = Json.Read<Dictionary<string, object>>(File.ReadAllText(manifestPath, Encoding.UTF8)); object value;
+            if (!manifest.TryGetValue("directories", out value) || !(value is System.Collections.IEnumerable)) return;
+            foreach (object item in (System.Collections.IEnumerable)value) {
+                string relative = item as string; if (relative == null) throw new IOException("备份目录清单无效。");
+                if (!snapshot.KeepPrevious.Any(p => p == "" || relative == p || relative.StartsWith(p + "/", StringComparison.Ordinal))) continue;
+                if (relative.Split('/').Any(p => Excluded(p, exclusions))) continue;
+                string target = SnapshotPath(snapshot.Path, relative);
+                if (File.Exists(target)) continue;
+                Directory.CreateDirectory(target); snapshot.Directories.Add(relative);
+            }
+        }
+        SnapshotJournal PrepareJournal(string repo, string stage, List<FolderJob> jobs, List<Snapshot> snapshots, string exclusions) {
             SnapshotJournal journal = new SnapshotJournal { Repo = repo, Baseline = Head(repo), Changes = new List<SnapshotChange>() };
             Dictionary<string, string> owners = RemoteOwners(repo);
             string index = Path.Combine(repo, ".git", "index"); Paths.Child(index, store.Root);
@@ -530,9 +614,11 @@ namespace CloudBackup {
                 if (known && owner != jobs[i].Id || !known && Directory.Exists(target))
                     throw new IOException("GitHub 目录已被其他备份或文件占用，请换一个名称：" + desired);
                 string previous = SavedRemoteDirectory(repo, jobs[i].Id);
+                PreserveUnavailable(repo, jobs[i], snapshots[i], exclusions);
                 string manifest = Path.Combine(stage, "manifest-" + jobs[i].Id + ".json");
                 File.WriteAllText(manifest, Json.Write(new { format = 2, name = jobs[i].Name, targetDirectory = desired,
-                    directories = snapshots[i].Directories.OrderBy(p => p, StringComparer.Ordinal).ToArray() }), new UTF8Encoding(false));
+                    directories = snapshots[i].Directories.Distinct(StringComparer.Ordinal).OrderBy(p => p, StringComparer.Ordinal).ToArray(),
+                    skipped = snapshots[i].Warnings.OrderBy(p => p.Path, StringComparer.Ordinal).ToArray() }), new UTF8Encoding(false));
                 AddSnapshotChange(journal, stage, jobs[i].Target, snapshots[i].Path, true);
                 AddSnapshotChange(journal, stage, "backup-manifests/" + jobs[i].Id + ".json", manifest, false);
                 if (!String.Equals(previous, desired, StringComparison.OrdinalIgnoreCase) && File.Exists(Path.Combine(repo, "backup-manifests", jobs[i].Id + ".json")))
@@ -599,7 +685,7 @@ namespace CloudBackup {
                     Report("扫描目录：" + job.Name);
                     snapshots.Add(Capture(job, Path.Combine(stageRoot, job.Id), settings.Exclusions));
                 }
-                SnapshotJournal journal = PrepareJournal(repo, stageRoot, jobs, snapshots);
+                SnapshotJournal journal = PrepareJournal(repo, stageRoot, jobs, snapshots, settings.Exclusions);
                 bool changed;
                 try {
                     ApplyJournal(journal);
@@ -629,10 +715,13 @@ namespace CloudBackup {
                 Paths.DeleteTree(stageRoot, store.Root);
                 if (changed) pushed = PushPending(repo, branch) || pushed;
                 int skipped = snapshots.Sum(s => s.Skipped);
+                int warnings = snapshots.Sum(s => s.Warnings.Count);
                 string message = changed ? "备份已推送" : (pushed ? "已补传之前的备份" : "内容未变化，本次未提交、未推送");
-                if (skipped > 0) message += "（排除/链接 " + skipped + " 项）";
+                if (warnings > 0) message += "；跳过 " + warnings + " 项，请查看日志（并非完整备份）";
+                if (skipped > warnings) message += "（另排除/链接 " + (skipped - warnings) + " 项）";
                 Report(message);
-                return new RunResult { Changed = changed, Pushed = pushed, Files = snapshots.Sum(s => s.Files), Skipped = skipped, Message = message };
+                return new RunResult { Changed = changed, Pushed = pushed, Files = snapshots.Sum(s => s.Files), Skipped = skipped, Message = message,
+                    JobWarnings = jobs.Select((job, i) => new { job.Id, Count = snapshots[i].Warnings.Count }).ToDictionary(p => p.Id, p => p.Count) };
             } finally { if (Directory.Exists(stageRoot) && !File.Exists(Path.Combine(stageRoot, "journal.json"))) Paths.DeleteTree(stageRoot, store.Root); }
         }
         public void PreserveConflict(Settings settings) {

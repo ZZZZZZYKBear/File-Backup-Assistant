@@ -263,7 +263,12 @@ namespace CloudBackup {
             RefreshGrid();
             try {
                 RunResult result = await Task.Run(delegate { return engine.Backup(snapshot); });
-                foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) { job.Status = result.Changed || result.Pushed ? "备份已推送" : "内容未变化"; job.LastCheck = DateTime.Now.ToString("MM-dd HH:mm:ss"); }
+                foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) {
+                    int warnings; result.JobWarnings.TryGetValue(job.Id, out warnings);
+                    job.Status = result.Changed || result.Pushed ? "备份已推送" : "内容未变化";
+                    if (warnings > 0) job.Status += " · 跳过 " + warnings + " 项";
+                    job.LastCheck = DateTime.Now.ToString("MM-dd HH:mm:ss");
+                }
                 if (result.Pushed) settings.LastPush = DateTime.Now.ToString("MM-dd HH:mm");
                 Report(result.Message);
             } catch (Exception error) {
