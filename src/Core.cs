@@ -19,8 +19,38 @@ namespace CloudBackup {
         public bool Enabled { get; set; }
         public string Status { get; set; }
         public string LastCheck { get; set; }
+        public string GitHubName { get; set; }
         public FolderJob() { Id = Guid.NewGuid().ToString("N"); Enabled = true; Status = "等待备份"; }
-        public string Target { get { return "backups/" + Id; } }
+        public string RemoteDirectory { get { return GitHubName == null ? Id : GitHubName; } }
+        public string Target { get { return "backups/" + RemoteDirectory; } }
+    }
+    public static class CloudNames {
+        public static string Normalize(string value) {
+            string name = (value ?? "").Trim();
+            if (name.Length == 0 || name.Length > 80 || name == "." || name == ".." || name.EndsWith(".") ||
+                name.Any(c => c < 32 || "<>:\"/\\|?*".IndexOf(c) >= 0) ||
+                Regex.IsMatch(name, @"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", RegexOptions.IgnoreCase) ||
+                new[] { ".git", ".svn", ".hg" }.Contains(name.ToLowerInvariant()))
+                throw new IOException("GitHub 目录名须为 1–80 个字符，可用中文、空格和短横线；不能包含路径分隔符、特殊字符或系统保留名。");
+            return name;
+        }
+        public static void ValidateJobs(IEnumerable<FolderJob> jobs) {
+            HashSet<string> ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (FolderJob job in jobs) {
+                if (!Regex.IsMatch(job.Id ?? "", "^[a-f0-9]{32}$") || !ids.Add(job.Id)) throw new IOException("备份任务编号无效或重复。");
+                string name = Normalize(job.RemoteDirectory);
+                if (name != job.RemoteDirectory) throw new IOException("目录名首尾不能包含空格。");
+                if (!names.Add(name)) throw new IOException("GitHub 目录名不能重复（包括停用任务）：" + name);
+            }
+        }
+        public static string Suggest(string value, string id, IEnumerable<FolderJob> jobs) {
+            string name = new string((value ?? "备份目录").Select(c => c < 32 || "<>:\"/\\|?*".IndexOf(c) >= 0 ? '-' : c).ToArray()).Trim().TrimEnd('.');
+            if (name.Length > 65) name = name.Substring(0, 65);
+            try { name = Normalize(name); } catch { name = "备份目录-" + id.Substring(0, 8); }
+            if (jobs.Any(j => String.Equals(j.RemoteDirectory, name, StringComparison.OrdinalIgnoreCase))) name += "-" + id.Substring(0, 8);
+            return name;
+        }
     }
     public sealed class Settings {
         public string Repository { get; set; }
@@ -58,6 +88,7 @@ namespace CloudBackup {
             foreach (FolderJob job in value.Folders) {
                 if (!Regex.IsMatch(job.Id ?? "", "^[a-f0-9]{32}$")) throw new InvalidDataException("备份目录编号无效。");
             }
+            CloudNames.ValidateJobs(value.Folders);
             return value;
         }
         public void Save(Settings settings) {
@@ -188,6 +219,7 @@ namespace CloudBackup {
     }
     public sealed class SnapshotChange {
         public string Relative { get; set; }
+        public string RestoreRelative { get; set; }
         public string Incoming { get; set; }
         public string Old { get; set; }
         public bool HadOld { get; set; }
@@ -285,6 +317,7 @@ namespace CloudBackup {
         void ConfigureCache(string repo) {
             git.Must(repo, "config", "core.autocrlf", "false");
             git.Must(repo, "config", "core.longpaths", "true");
+            git.Must(repo, "config", "core.ignorecase", "false");
             git.Must(repo, "config", "user.name", "GitHub Backup Assistant");
             git.Must(repo, "config", "user.email", "backup-assistant@users.noreply.github.com");
             string info = Path.Combine(repo, ".git", "info"); Directory.CreateDirectory(info);
@@ -355,35 +388,84 @@ namespace CloudBackup {
             string index = Path.Combine(journal.Repo, ".git", "index"); Paths.Child(index, store.Root);
             if (File.Exists(index + ".lock")) throw new IOException("Git 索引仍被占用，事务记录已保留；请稍后重试。");
             foreach (SnapshotChange change in journal.Changes) {
-                if (!Regex.IsMatch(change.Relative, @"^(?:backups/[a-f0-9]{32}|backup-manifests/[a-f0-9]{32}\.json)$")) throw new IOException("事务目标路径无效。");
+                ValidateSnapshotRelative(change.Relative);
                 string target = Path.Combine(journal.Repo, change.Relative.Replace('/', Path.DirectorySeparatorChar));
+                string restoreRelative = change.RestoreRelative ?? change.Relative; ValidateSnapshotRelative(restoreRelative);
+                string restoreTarget = Path.Combine(journal.Repo, restoreRelative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(restoreTarget, store.Root);
                 Paths.Child(target, store.Root); Paths.Child(change.Old, stage);
                 bool oldExists = change.Directory ? Directory.Exists(change.Old) : File.Exists(change.Old);
                 if (oldExists) {
                     RemoveEntry(target, change.Directory);
-                    if (change.Directory) Directory.Move(change.Old, target); else File.Move(change.Old, target);
+                    if (change.Directory) Directory.Move(change.Old, restoreTarget); else File.Move(change.Old, restoreTarget);
                 } else if (!change.HadOld) RemoveEntry(target, change.Directory);
             }
             if (journal.HadIndex) File.Copy(Path.Combine(stage, "index.previous"), index, true);
             else if (File.Exists(index)) File.Delete(index);
             Paths.DeleteTree(stage, store.Root);
         }
+        static void ValidateSnapshotRelative(string relative) {
+            if (relative != null && relative.StartsWith("backups/", StringComparison.Ordinal)) {
+                string name = relative.Substring("backups/".Length);
+                if (CloudNames.Normalize(name) == name) return;
+            } else if (Regex.IsMatch(relative ?? "", @"^backup-manifests/[a-f0-9]{32}\.json$")) return;
+            throw new IOException("事务目标路径无效。");
+        }
+        string SavedRemoteDirectory(string repo, string id) {
+            string path = Path.Combine(repo, "backup-manifests", id + ".json"); Paths.Child(path, store.Root);
+            if (!File.Exists(path)) return id;
+            Dictionary<string, object> manifest = Json.Read<Dictionary<string, object>>(File.ReadAllText(path, Encoding.UTF8));
+            object value; int format;
+            if (manifest == null || !manifest.TryGetValue("format", out value) || !Int32.TryParse(Convert.ToString(value), out format) || format < 1 || format > 2)
+                throw new IOException("云端目录清单格式无法识别，已停止以避免覆盖：" + id);
+            string name = format == 1 ? id : manifest.TryGetValue("targetDirectory", out value) ? value as string : null;
+            if (CloudNames.Normalize(name) != name) throw new IOException("云端目录清单包含无效路径。");
+            return name;
+        }
+        Dictionary<string, string> RemoteOwners(string repo) {
+            Dictionary<string, string> owners = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string directory = Path.Combine(repo, "backup-manifests"); Paths.Child(directory, store.Root);
+            if (!Directory.Exists(directory)) return owners;
+            foreach (string path in Directory.GetFiles(directory, "*.json")) {
+                string id = Path.GetFileNameWithoutExtension(path);
+                if (!Regex.IsMatch(id, "^[a-f0-9]{32}$")) continue;
+                string name = SavedRemoteDirectory(repo, id), existing;
+                if (owners.TryGetValue(name, out existing) && existing != id) throw new IOException("云端目录清单存在重名，请先检查：" + name);
+                owners[name] = id;
+            }
+            return owners;
+        }
+        void AddSnapshotChange(SnapshotJournal journal, string stage, string relative, string incoming, bool directory) {
+            ValidateSnapshotRelative(relative);
+            string target = Path.Combine(journal.Repo, relative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(target, store.Root);
+            if (directory && File.Exists(target) || !directory && Directory.Exists(target)) throw new IOException("远端备份路径类型不匹配：" + relative);
+            string restore = relative;
+            if (directory && Directory.Exists(target)) {
+                string actual = System.IO.Directory.GetDirectories(Path.GetDirectoryName(target)).FirstOrDefault(p => String.Equals(p, target, StringComparison.OrdinalIgnoreCase));
+                if (actual != null) restore = "backups/" + Path.GetFileName(actual);
+            }
+            journal.Changes.Add(new SnapshotChange { Relative = relative, RestoreRelative = restore, Directory = directory, Incoming = incoming,
+                Old = Path.Combine(stage, "old-" + journal.Changes.Count), HadOld = directory ? Directory.Exists(target) : File.Exists(target) });
+        }
         SnapshotJournal PrepareJournal(string repo, string stage, List<FolderJob> jobs, List<Snapshot> snapshots) {
             SnapshotJournal journal = new SnapshotJournal { Repo = repo, Baseline = Head(repo), Changes = new List<SnapshotChange>() };
+            Dictionary<string, string> owners = RemoteOwners(repo);
             string index = Path.Combine(repo, ".git", "index"); Paths.Child(index, store.Root);
             if (File.Exists(index + ".lock")) throw new IOException("Git 索引被占用，请稍后重试。");
             journal.HadIndex = File.Exists(index); if (journal.HadIndex) File.Copy(index, Path.Combine(stage, "index.previous"));
             for (int i = 0; i < jobs.Count; i++) {
+                string desired = jobs[i].RemoteDirectory, owner;
+                string target = Path.Combine(repo, jobs[i].Target.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(target, store.Root);
+                bool known = owners.TryGetValue(desired, out owner);
+                if (known && owner != jobs[i].Id || !known && Directory.Exists(target))
+                    throw new IOException("GitHub 目录已被其他备份或文件占用，请换一个名称：" + desired);
+                string previous = SavedRemoteDirectory(repo, jobs[i].Id);
                 string manifest = Path.Combine(stage, "manifest-" + jobs[i].Id + ".json");
-                File.WriteAllText(manifest, Json.Write(new { format = 1, name = jobs[i].Name, directories = snapshots[i].Directories.OrderBy(p => p, StringComparer.Ordinal).ToArray() }), new UTF8Encoding(false));
-                foreach (bool directory in new[] { true, false }) {
-                    string relative = directory ? jobs[i].Target : "backup-manifests/" + jobs[i].Id + ".json";
-                    string target = Path.Combine(repo, relative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(target, store.Root);
-                    if (directory && File.Exists(target) || !directory && Directory.Exists(target)) throw new IOException("远端备份路径类型不匹配：" + relative);
-                    journal.Changes.Add(new SnapshotChange { Relative = relative, Directory = directory,
-                        Incoming = directory ? snapshots[i].Path : manifest, Old = Path.Combine(stage, "old-" + journal.Changes.Count),
-                        HadOld = directory ? Directory.Exists(target) : File.Exists(target) });
-                }
+                File.WriteAllText(manifest, Json.Write(new { format = 2, name = jobs[i].Name, targetDirectory = desired,
+                    directories = snapshots[i].Directories.OrderBy(p => p, StringComparer.Ordinal).ToArray() }), new UTF8Encoding(false));
+                AddSnapshotChange(journal, stage, jobs[i].Target, snapshots[i].Path, true);
+                AddSnapshotChange(journal, stage, "backup-manifests/" + jobs[i].Id + ".json", manifest, false);
+                if (!String.Equals(previous, desired, StringComparison.OrdinalIgnoreCase) && File.Exists(Path.Combine(repo, "backup-manifests", jobs[i].Id + ".json")))
+                    AddSnapshotChange(journal, stage, "backups/" + previous, null, true);
             }
             string journalFile = Path.Combine(stage, "journal.json");
             File.WriteAllText(journalFile + ".tmp", Json.Write(journal), new UTF8Encoding(false));
@@ -393,10 +475,11 @@ namespace CloudBackup {
         void ApplyJournal(SnapshotJournal journal) {
             foreach (SnapshotChange change in journal.Changes) {
                 string target = Path.Combine(journal.Repo, change.Relative.Replace('/', Path.DirectorySeparatorChar));
-                Paths.Child(target, store.Root); Paths.Child(change.Old, store.Root); Paths.Child(change.Incoming, store.Root);
+                Paths.Child(target, store.Root); Paths.Child(change.Old, store.Root);
+                if (change.Incoming != null) Paths.Child(change.Incoming, store.Root);
                 Directory.CreateDirectory(Path.GetDirectoryName(target));
                 if (change.HadOld) { if (change.Directory) Directory.Move(target, change.Old); else File.Move(target, change.Old); }
-                if (change.Directory) Directory.Move(change.Incoming, target); else File.Move(change.Incoming, target);
+                if (change.Incoming != null) { if (change.Directory) Directory.Move(change.Incoming, target); else File.Move(change.Incoming, target); }
             }
         }
         void Reconcile(string repo, string branch) {
@@ -425,6 +508,7 @@ namespace CloudBackup {
         }
         public RunResult Backup(Settings settings) {
             string remote = AllowLocalRemoteForTests ? settings.Repository : ValidateRemote(settings.Repository);
+            CloudNames.ValidateJobs(settings.Folders);
             List<FolderJob> jobs = settings.Folders.Where(j => j.Enabled).ToList();
             if (jobs.Count == 0) return new RunResult { Message = "请先添加并启用至少一个备份目录。" };
             foreach (FolderJob job in jobs) {
@@ -449,6 +533,12 @@ namespace CloudBackup {
                 try {
                     ApplyJournal(journal);
                     if (FaultForTests != null) FaultForTests("before-add");
+                    // Windows resolves the old casing to the new directory, so
+                    // add -A alone cannot notice that the old index path vanished.
+                    // The journal already saved the index for rollback.
+                    foreach (SnapshotChange change in journal.Changes.Where(c => c.Directory && c.HadOld &&
+                        c.RestoreRelative != c.Relative && String.Equals(c.RestoreRelative, c.Relative, StringComparison.OrdinalIgnoreCase)))
+                        git.Must(repo, "rm", "--cached", "-r", "--ignore-unmatch", "--", change.RestoreRelative);
                     List<string> add = new List<string> { "add", "-f", "-A", "--", "backups", "backup-manifests" };
                     git.Must(repo, add.ToArray());
                     GitResult diff = git.Run(repo, "diff", "--cached", "--quiet", "--exit-code");

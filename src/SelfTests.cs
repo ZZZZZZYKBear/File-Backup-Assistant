@@ -129,6 +129,72 @@ namespace CloudBackup {
                 Assert(git.Must(cache, "for-each-ref", "--format=%(objectname)", "refs/backup-recovery/").Contains(pendingHead), "Conflict recovery lost pending commit.");
                 Assert(engine.Backup(settings).Pushed && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[1].Target + "/new.txt") == "local-conflict", "Explicit conflict recovery failed.");
                 passed.Add("explicit conflict recovery retains old commit and resumes backup");
+                Settings legacy = Json.Read<Settings>(Json.Write(new { Repository = remote, Folders = new[] { new { Id = settings.Folders[0].Id, Name = "legacy", Source = source, Enabled = true } } }));
+                Assert(legacy.Folders[0].GitHubName == null && legacy.Folders[0].Target == "backups/" + settings.Folders[0].Id, "Old settings changed destination on load.");
+                passed.Add("legacy settings retain their original cloud directory");
+                string oldPath = settings.Folders[0].Target, beforeRename = git.Must(root, "--git-dir", remote, "rev-parse", "HEAD");
+                // Simulate an original format1 remote manifest before migration.
+                string legacyManifest = Path.Combine(cache, "backup-manifests", settings.Folders[0].Id + ".json");
+                File.WriteAllText(legacyManifest, Json.Write(new { format = 1, name = settings.Folders[0].Name, directories = new[] { "" } }), new UTF8Encoding(false));
+                git.Must(cache, "add", "--all"); git.Must(cache, "commit", "-m", "test legacy manifest"); git.Must(cache, "push", "origin", "main");
+                settings.Folders[0].GitHubName = "工作文档 v1";
+                Assert(engine.Backup(settings).Pushed, "Custom Chinese directory rename failed.");
+                files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                Assert(!files.Contains(oldPath + "/") && files.Contains(settings.Folders[0].Target + "/中文.txt"), "Old directory was duplicated instead of migrated.");
+                Assert(git.Must(root, "--git-dir", remote, "show", beforeRename + ":" + oldPath + "/中文.txt") == "transaction-content", "Rename lost old Git history.");
+                store.Save(settings); Assert(store.Load().Folders[0].GitHubName == "工作文档 v1", "Custom directory name was not persisted.");
+                Assert(!engine.Backup(settings).Changed, "Repeated named backup created a commit.");
+                passed.Add("Chinese and spaced directory names + format1 migration + history + persistence");
+                settings.Folders[0].GitHubName = "工作文档 v2";
+                engine.FaultForTests = delegate(string phase) { if (phase == "before-commit") throw new IOException("rename failure"); };
+                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
+                Assert(blocked && git.Must(cache, "status", "--porcelain") == "", "Rename failure did not restore previous path and index.");
+                engine.FaultForTests = null; Assert(engine.Backup(settings).Pushed, "Rename could not retry after rollback.");
+                passed.Add("directory rename rollback and retry");
+                settings.Folders[1].GitHubName = "Docs"; Assert(engine.Backup(settings).Pushed, "Initial ASCII name failed.");
+                settings.Folders[1].GitHubName = "docs";
+                engine.FaultForTests = delegate(string phase) { if (phase == "before-commit") throw new IOException("case rename failure"); };
+                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
+                Assert(blocked && git.Must(cache, "status", "--porcelain") == "", "Case-only rename rollback left directory casing dirty.");
+                engine.FaultForTests = null; Assert(engine.Backup(settings).Pushed, "Case-only rename failed.");
+                files = git.Must(root, "--git-dir", remote, "ls-tree", "-r", "--name-only", "HEAD");
+                Assert(files.Contains("backups/docs/new.txt") && !files.Contains("backups/Docs/new.txt"), "Case-only destination did not change on GitHub.");
+                passed.Add("case-only cloud directory rename and rollback on Windows");
+                string[] invalidNames = { "", " ", ".", "..", "../escape", "one/two", "one\\two", "NUL.txt", ".git", "x.", "x:invalid", new string('x', 81) };
+                foreach (string invalid in invalidNames) { blocked = false; try { CloudNames.Normalize(invalid); } catch (IOException) { blocked = true; } Assert(blocked, "Invalid cloud name accepted: " + invalid); }
+                settings.Folders[2].Enabled = false; settings.Folders[2].GitHubName = "DOCS";
+                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
+                Assert(blocked, "Disabled task's duplicate name was accepted."); settings.Folders[2].Enabled = true; settings.Folders[2].GitHubName = null;
+                passed.Add("unsafe cloud names and case-insensitive duplicate names rejected");
+                git.Must(peer, "pull", "--ff-only"); Directory.CreateDirectory(Path.Combine(peer, "backups", "occupied")); File.WriteAllText(Path.Combine(peer, "backups", "occupied", "keep.txt"), "do-not-overwrite");
+                git.Must(peer, "add", "--all"); git.Must(peer, "commit", "-m", "unmanaged cloud directory"); git.Must(peer, "push", "origin", "main");
+                string desiredName = settings.Folders[0].GitHubName; settings.Folders[0].GitHubName = "occupied";
+                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; }
+                Assert(blocked && git.Must(root, "--git-dir", remote, "show", "HEAD:backups/occupied/keep.txt") == "do-not-overwrite", "An unmanaged remote directory was overwritten.");
+                settings.Folders[0].GitHubName = desiredName;
+                passed.Add("remote directory ownership collision leaves other files unchanged");
+                string existingManifest = File.ReadAllText(legacyManifest, Encoding.UTF8);
+                File.WriteAllText(legacyManifest, Json.Write(new { format = 99, targetDirectory = desiredName }));
+                git.Must(cache, "add", "--all"); git.Must(cache, "commit", "-m", "future manifest"); git.Must(cache, "push", "origin", "main");
+                blocked = false; try { engine.Backup(settings); } catch (IOException) { blocked = true; } Assert(blocked, "Unknown manifest format was accepted.");
+                File.WriteAllText(legacyManifest, existingManifest, new UTF8Encoding(false)); git.Must(cache, "add", "--all"); git.Must(cache, "commit", "-m", "restore manifest"); git.Must(cache, "push", "origin", "main");
+                Assert(!engine.Backup(settings).Changed, "Future-manifest recovery created unnecessary changes.");
+                passed.Add("unknown manifest format stops migration safely");
+                Store uiStore = new Store(Path.Combine(root, "ui-preview"));
+                using (MainForm form = new MainForm(uiStore, false, true)) {
+                    form.ShowInTaskbar = false; form.Opacity = 0; form.Show(); System.Windows.Forms.Application.DoEvents();
+                    System.Windows.Forms.DataGridView table = (System.Windows.Forms.DataGridView)typeof(MainForm).GetField("grid", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(form);
+                    Assert(table.Columns[4].HeaderText == "GitHub 目录名", "Cloud name column is not in the requested position.");
+                    table.CurrentCell = table.Rows[0].Cells[4]; table.BeginEdit(true);
+                    ((System.Windows.Forms.TextBox)table.EditingControl).Text = "UI 中文目录";
+                    Assert(table.EndEdit(), "Cloud name UI edit failed."); System.Windows.Forms.Application.DoEvents();
+                    Assert(uiStore.Load().Folders[0].GitHubName == "UI 中文目录", "Edited cloud name did not save to settings.");
+                    table.BeginEdit(true); ((System.Windows.Forms.TextBox)table.EditingControl).Text = "../invalid";
+                    table.EndEdit(); System.Windows.Forms.Application.DoEvents();
+                    Assert(uiStore.Load().Folders[0].GitHubName == "UI 中文目录" && Convert.ToString(table.Rows[0].Cells[4].Value) == "UI 中文目录", "UI accepted invalid destination.");
+                    table.CancelEdit(); form.ForceExit();
+                }
+                passed.Add("editable cloud-name column saves valid input and blocks invalid input");
                 string report = Json.Write(new { success = true, passed = passed, root = root });
                 File.WriteAllText(Path.Combine(root, "result.json"), report, Encoding.UTF8); Console.WriteLine(report); return 0;
             } catch (Exception error) {
@@ -138,6 +204,7 @@ namespace CloudBackup {
         }
     }
     public static class TestRunner {
+        [STAThread]
         public static int Main(string[] args) { return SelfTests.Run(args.Length > 0 ? args[0] : Environment.CurrentDirectory); }
     }
 }

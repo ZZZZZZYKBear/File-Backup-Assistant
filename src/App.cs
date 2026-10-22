@@ -73,8 +73,8 @@ namespace CloudBackup {
             catch (Exception error) { state.Text = error.Message; }
             if (!preview) { try { Startup.Set(settings.AutoStart); } catch (Exception error) { Report("开机自启设置未完成：" + error.Message); } }
             if (preview) {
-                settings.Folders.Add(new FolderJob { Name = "我的文档", Source = @"D:\资料\工作文档", Status = "内容未变化", LastCheck = "今天 12:00" });
-                settings.Folders.Add(new FolderJob { Name = "项目笔记", Source = @"D:\资料\项目笔记", Status = "备份已推送", LastCheck = "今天 12:00" });
+                settings.Folders.Add(new FolderJob { Name = "我的文档", Source = @"D:\资料\工作文档", GitHubName = "工作文档", Status = "内容未变化", LastCheck = "今天 12:00" });
+                settings.Folders.Add(new FolderJob { Name = "项目笔记", Source = @"D:\资料\项目笔记", GitHubName = "项目笔记备份", Status = "备份已推送", LastCheck = "今天 12:00" });
                 state.Text = "一切就绪，等待下一次检查";
             }
             RefreshGrid(); RefreshHeader();
@@ -146,18 +146,51 @@ namespace CloudBackup {
             grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(236, 240, 247); grid.ColumnHeadersDefaultCellStyle.ForeColor = muted; grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
             grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(230, 237, 255); grid.DefaultCellStyle.SelectionForeColor = ink; grid.DefaultCellStyle.Padding = new Padding(5, 0, 5, 0);
             grid.GridColor = Color.FromArgb(236, 240, 247); grid.RowTemplate.Height = 43; grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
-            grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = "启用", FillWeight = 10 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "目录名称", ReadOnly = true, FillWeight = 25 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "本地路径", ReadOnly = true, FillWeight = 60 });
-            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "状态", ReadOnly = true, FillWeight = 42 });
+            grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "Enabled", HeaderText = "启用", FillWeight = 10, MinimumWidth = 60 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "目录名称", ReadOnly = true, FillWeight = 23 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "本地路径", ReadOnly = true, FillWeight = 50 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "状态", ReadOnly = true, FillWeight = 30 });
+            grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "GitHubName", HeaderText = "GitHub 目录名", ReadOnly = false, FillWeight = 36,
+                ToolTipText = "双击编辑，回车保存；下次备份时会迁移到新名称。支持中文。" });
             grid.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "最近检查", ReadOnly = true, FillWeight = 30 });
-            grid.CurrentCellDirtyStateChanged += delegate { if (grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            grid.CurrentCellDirtyStateChanged += delegate { if (grid.CurrentCell is DataGridViewCheckBoxCell && grid.IsCurrentCellDirty) grid.CommitEdit(DataGridViewDataErrorContexts.Commit); };
+            grid.CellValidating += delegate(object sender, DataGridViewCellValidatingEventArgs e) {
+                if (loadingGrid || busy || e.RowIndex < 0 || e.ColumnIndex != 4) return;
+                try {
+                    string name = CloudNames.Normalize(Convert.ToString(e.FormattedValue));
+                    FolderJob current = grid.Rows[e.RowIndex].Tag as FolderJob;
+                    if (settings.Folders.Any(j => j != current && String.Equals(j.RemoteDirectory, name, StringComparison.OrdinalIgnoreCase))) throw new IOException("GitHub 目录名与其他任务重复，请换一个名称。");
+                    grid.Rows[e.RowIndex].ErrorText = "";
+                } catch (Exception error) { e.Cancel = true; grid.Rows[e.RowIndex].ErrorText = error.Message; Report(error.Message + "（Esc 可取消编辑）"); }
+            };
+            grid.CellEndEdit += delegate(object sender, DataGridViewCellEventArgs e) { if (e.RowIndex >= 0) grid.Rows[e.RowIndex].ErrorText = ""; };
             grid.CellValueChanged += delegate(object sender, DataGridViewCellEventArgs e) {
-                if (loadingGrid || busy || e.RowIndex < 0 || e.ColumnIndex != 0) return;
-                FolderJob job = grid.Rows[e.RowIndex].Tag as FolderJob; if (job != null) { job.Enabled = Convert.ToBoolean(grid.Rows[e.RowIndex].Cells[0].Value); store.Save(settings); RefreshHeader(); }
+                if (loadingGrid || busy || e.RowIndex < 0 || e.ColumnIndex != 0 && e.ColumnIndex != 4) return;
+                FolderJob job = grid.Rows[e.RowIndex].Tag as FolderJob; if (job == null) return;
+                string previousName = job.GitHubName; bool previousEnabled = job.Enabled;
+                try {
+                    if (e.ColumnIndex == 0) job.Enabled = Convert.ToBoolean(grid.Rows[e.RowIndex].Cells[0].Value);
+                    else {
+                        string name = CloudNames.Normalize(Convert.ToString(grid.Rows[e.RowIndex].Cells[4].Value));
+                        if (name == job.RemoteDirectory) return;
+                        job.GitHubName = name; CloudNames.ValidateJobs(settings.Folders);
+                    }
+                    store.Save(settings);
+                    if (e.ColumnIndex == 4) {
+                        loadingGrid = true; grid.Rows[e.RowIndex].Cells[4].Value = job.RemoteDirectory; loadingGrid = false;
+                        job.Status = "目录名待同步"; grid.Rows[e.RowIndex].Cells[3].Value = job.Status;
+                        grid.Rows[e.RowIndex].Cells[4].ToolTipText = "云端位置：" + job.Target;
+                        Report("GitHub 目录名已保存：" + job.RemoteDirectory + "。点击立即备份或等待计划检查生效。");
+                    }
+                    RefreshHeader();
+                } catch (Exception error) {
+                    job.GitHubName = previousName; job.Enabled = previousEnabled; loadingGrid = true;
+                    grid.Rows[e.RowIndex].Cells[0].Value = previousEnabled; grid.Rows[e.RowIndex].Cells[4].Value = job.RemoteDirectory;
+                    loadingGrid = false; Report("未保存：" + error.Message);
+                }
             };
             grid.CellDoubleClick += delegate(object sender, DataGridViewCellEventArgs e) {
-                if (e.RowIndex >= 0 && e.ColumnIndex != 0) { FolderJob job = grid.Rows[e.RowIndex].Tag as FolderJob; if (job != null && Directory.Exists(job.Source)) Open(job.Source); }
+                if (e.RowIndex >= 0 && e.ColumnIndex != 0 && e.ColumnIndex != 4) { FolderJob job = grid.Rows[e.RowIndex].Tag as FolderJob; if (job != null && Directory.Exists(job.Source)) Open(job.Source); }
             };
             layout.Controls.Add(grid, 0, 4);
             state.Dock = DockStyle.Fill; state.TextAlign = ContentAlignment.MiddleLeft; state.AutoEllipsis = true; state.Text = "添加一个或多个目录，即可开始备份。"; state.ForeColor = muted; layout.Controls.Add(state, 0, 5);
@@ -191,8 +224,9 @@ namespace CloudBackup {
         void RefreshGrid() {
             loadingGrid = true; grid.Rows.Clear();
             foreach (FolderJob job in settings.Folders) {
-                int i = grid.Rows.Add(job.Enabled, job.Name, job.Source, job.Status, job.LastCheck ?? "尚未检查");
+                int i = grid.Rows.Add(job.Enabled, job.Name, job.Source, job.Status, job.RemoteDirectory, job.LastCheck ?? "尚未检查");
                 grid.Rows[i].Tag = job; grid.Rows[i].Cells[1].ToolTipText = "云端位置：" + job.Target;
+                grid.Rows[i].Cells[4].ToolTipText = "双击编辑，回车保存。云端位置：" + job.Target;
             }
             loadingGrid = false;
         }
@@ -222,6 +256,7 @@ namespace CloudBackup {
         }
         async Task Backup() {
             if (busy) return;
+            if (!grid.EndEdit()) return;
             if (engine == null || !settings.Folders.Any(j => j.Enabled)) { Report("请先添加并启用目录，并确认已安装 Git。"); return; }
             Settings snapshot = settings.Copy(); SetBusy(true);
             foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) job.Status = "检查中…";
@@ -244,17 +279,20 @@ namespace CloudBackup {
         }
         void AddFolder() {
             if (busy) return;
+            if (!grid.EndEdit()) return;
             using (FolderBrowserDialog dialog = new FolderBrowserDialog { Description = "选择要备份到 GitHub 的文件夹（之后可继续添加）", ShowNewFolderButton = false }) {
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
                 try {
                     Paths.Source(dialog.SelectedPath, store.Root);
                     if (settings.Folders.Any(j => Paths.Equal(j.Source, dialog.SelectedPath))) { MessageBox.Show("这个目录已在备份列表中。"); return; }
-                    settings.Folders.Add(new FolderJob { Name = Path.GetFileName(Paths.Full(dialog.SelectedPath)), Source = Paths.Full(dialog.SelectedPath) });
+                    FolderJob added = new FolderJob { Name = Path.GetFileName(Paths.Full(dialog.SelectedPath)), Source = Paths.Full(dialog.SelectedPath) };
+                    added.GitHubName = CloudNames.Suggest(added.Name, added.Id, settings.Folders); settings.Folders.Add(added);
                     store.Save(settings); RefreshGrid(); RefreshHeader(); Report("目录已添加，可点击“立即备份”，或等待下一次每小时检查。");
                 } catch (Exception error) { MessageBox.Show(error.Message, "无法添加目录"); }
             }
         }
         void RemoveFolder() {
+            if (!grid.EndEdit()) return;
             List<FolderJob> selected = grid.SelectedRows.Cast<DataGridViewRow>().Select(r => r.Tag as FolderJob).Where(j => j != null).ToList();
             if (selected.Count == 0) return;
             if (MessageBox.Show("移除选中的 " + selected.Count + " 个备份任务？\n本地源文件、云端现有备份和历史均保留。", "移除备份任务", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
@@ -262,6 +300,7 @@ namespace CloudBackup {
         }
         async void Preferences() {
             if (busy) return;
+            if (!grid.EndEdit()) return;
             using (SettingsForm form = new SettingsForm(settings.Copy(), store.Root)) {
                 DialogResult result = form.ShowDialog(this);
                 if (result == DialogResult.Retry) {
