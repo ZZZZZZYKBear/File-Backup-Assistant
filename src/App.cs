@@ -26,6 +26,8 @@ namespace CloudBackup {
                     }
                     return 0;
                 }
+                string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHubBackupAssistant");
+                if (DesktopContext.RelaunchIfRedirected(root, args.Contains("--tray"))) return 0;
                 bool created;
                 using (Mutex single = new Mutex(true, @"Local\GitHubBackupAssistant-" + Engine.Key(Environment.UserName), out created)) {
                     if (!created) {
@@ -34,7 +36,6 @@ namespace CloudBackup {
                         else MessageBox.Show("助手已经在运行，请在系统托盘中打开。", "云笺备份");
                         return 0;
                     }
-                    string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "GitHubBackupAssistant");
                     Application.Run(new MainForm(new Store(root), args.Contains("--tray"), false));
                     single.ReleaseMutex();
                 }
@@ -47,6 +48,66 @@ namespace CloudBackup {
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindow(string cls, string title);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window, int command);
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr window);
+    }
+    internal static class DesktopContext {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern uint GetFinalPathNameByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, System.Text.StringBuilder path, uint size, uint flags);
+        internal static string PhysicalPath(string path) {
+            using (var handle = CreateFile(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new IOException("无法确认应用数据位置：" + new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()).Message);
+                var result = new System.Text.StringBuilder(32768);
+                uint length = GetFinalPathNameByHandle(handle, result, (uint)result.Capacity, 0);
+                if (length == 0 || length >= result.Capacity) throw new IOException("无法确认应用数据的真实位置。");
+                string physical = result.ToString();
+                if (physical.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) return @"\\" + physical.Substring(8);
+                return physical.StartsWith(@"\\?\", StringComparison.Ordinal) ? physical.Substring(4) : physical;
+            }
+        }
+        internal static bool IsRedirected(string requested, string physical) {
+            return !Paths.Equal(requested, physical) &&
+                physical.IndexOf(@"\Packages\", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                physical.IndexOf(@"\LocalCache\", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        internal static bool RelaunchIfRedirected(string root, bool tray) {
+            Directory.CreateDirectory(root);
+            string config = Path.Combine(root, "settings.json");
+            bool redirected = File.Exists(config) && IsRedirected(config, PhysicalPath(config));
+            // A package may read the real file until its first write (copy on
+            // write), so checking only the existing configuration is insufficient.
+            if (!redirected) {
+                string probe = Path.Combine(root, "context-" + Guid.NewGuid().ToString("N") + ".tmp");
+                try {
+                    using (FileStream file = new FileStream(probe, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+                    redirected = IsRedirected(probe, PhysicalPath(probe));
+                } finally { if (File.Exists(probe)) File.Delete(probe); }
+            }
+            if (!redirected) return false;
+            string executable = PhysicalPath(Application.ExecutablePath), target = executable;
+            if (IsRedirected(Application.ExecutablePath, executable))
+                throw new IOException("安装文件也被启动器重定向，请从 Windows 桌面运行安装脚本后启动，避免使用临时包缓存作为自启路径。");
+            if (tray) {
+                // The physical shortcut remains accessible to Explorer even
+                // when the caller's logical AppData path is virtualized.
+                string link = Path.Combine(root, "desktop-launch.lnk");
+                object shell = null, shortcut = null;
+                try {
+                    shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
+                    shortcut = shell.GetType().InvokeMember("CreateShortcut", System.Reflection.BindingFlags.InvokeMethod, null, shell, new object[] { link });
+                    Type type = shortcut.GetType();
+                    type.InvokeMember("TargetPath", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { executable });
+                    type.InvokeMember("Arguments", System.Reflection.BindingFlags.SetProperty, null, shortcut, new object[] { "--tray" });
+                    type.InvokeMember("Save", System.Reflection.BindingFlags.InvokeMethod, null, shortcut, null);
+                    target = PhysicalPath(link);
+                } finally {
+                    if (shortcut != null) Marshal.FinalReleaseComObject(shortcut);
+                    if (shell != null) Marshal.FinalReleaseComObject(shell);
+                }
+            }
+            Process.Start(new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"), Git.Quote(target)) { UseShellExecute = false, CreateNoWindow = true });
+            return true;
+        }
     }
     public sealed class MainForm : Form {
         readonly Store store; Settings settings; Engine engine;

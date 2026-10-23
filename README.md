@@ -4,7 +4,7 @@ Windows 桌面及托盘应用。将一个或多个文件夹定时备份到 GitHu
 
 ## 下载
 
-[下载 Windows 安装包 v1.3.0](releases/CloudBackupAssistant-1.3.0-Windows.zip)
+[下载 Windows 安装包 v1.3.1](releases/CloudBackupAssistant-1.3.1-Windows.zip)
 
 解压后直接运行同目录的 `GitHubBackupAssistant.exe`。安装包包含程序、运行配置、安装脚本和使用说明；不需要 Python、Node 或 Codex。
 
@@ -38,6 +38,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 文件删除会记录为新的 Git 提交，旧内容仍在历史中；移除一个备份任务不会删除云端现有备份。助手仅备份，不主动覆盖或恢复本地源文件。需要恢复时，可下载/克隆仓库，参照对应 manifest 的 name 找到原目录，将备份文件复制到你选择的恢复目录。空目录可根据 directories 清单重建。历史版本可在 GitHub 提交记录中查找。
 
 应用设置、日志和缓存保存在 `%LOCALAPPDATA%\GitHubBackupAssistant`。不要删除缓存中的待推送提交。推送失败后会保留提交，下一轮先补传；不会强制推送。远端发生内容冲突时会停止并提示，在“设置 → 处理远端备份冲突”可以保留本地恢复引用，再基于远端最新历史和当前源文件继续备份。恢复引用位于缓存仓库 `refs/backup-recovery/`，可通过 Git 查看。
+
+从 Codex 等 MSIX 应用启动时，Windows 可能把相同的 AppData 路径重定向到启动器私有目录，导致看到另一份任务列表。v1.3.1 会在读取配置和取得单实例锁之前检查实际读写位置；若发生这种重定向，会交给 Windows 桌面环境启动，继续使用原有桌面配置及缓存，不复制或覆盖两份配置。安装脚本也通过桌面环境打开助手。
 
 快照在完整复制后才应用到缓存，并以事务日志记录旧快照和索引。提交前失败会回滚；异常中断后下轮自动恢复。提交成功但推送失败时保留已生成提交。
 

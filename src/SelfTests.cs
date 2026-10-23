@@ -30,6 +30,12 @@ namespace CloudBackup {
                 Engine engine = new Engine(store) { AllowLocalRemoteForTests = true };
                 store.Save(settings); store.Save(settings);
                 Assert(store.Load().Folders.Count == 3 && File.Exists(store.Config + ".previous"), "Settings atomic replacement failed."); passed.Add("atomic settings persistence");
+                string logicalConfig = @"C:\Users\Example\AppData\Local\GitHubBackupAssistant\settings.json";
+                Assert(DesktopContext.IsRedirected(logicalConfig, @"D:\WpSystem\Example\AppData\Local\Packages\Example.App\LocalCache\Local\GitHubBackupAssistant\settings.json"), "Cross-drive MSIX config redirection was not detected.");
+                Assert(!DesktopContext.IsRedirected(logicalConfig, logicalConfig) &&
+                    !DesktopContext.IsRedirected(logicalConfig, @"D:\NormalUserData\GitHubBackupAssistant\settings.json"), "A regular config path was mistaken for MSIX redirection.");
+                Assert(Paths.Equal(DesktopContext.PhysicalPath(store.Config), store.Config), "Normal file-handle path resolution changed the settings location.");
+                passed.Add("physical config path identifies MSIX redirection without treating ordinary paths as package data");
                 Store saveStore = new Store(Path.Combine(root, "save-regression"));
                 Settings saveSettings = new Settings(); saveStore.Save(saveSettings); saveStore.Save(saveSettings);
                 string previousConfig = saveStore.Config + ".previous";
