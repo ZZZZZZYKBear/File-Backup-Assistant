@@ -4,7 +4,7 @@ Windows 桌面及托盘应用。将一个或多个文件夹定时备份到 GitHu
 
 ## 下载
 
-[下载 Windows 安装包 v1.2.0](releases/CloudBackupAssistant-1.2.0-Windows.zip)
+[下载 Windows 安装包 v1.3.0](releases/CloudBackupAssistant-1.3.0-Windows.zip)
 
 解压后直接运行同目录的 `GitHubBackupAssistant.exe`。安装包包含程序、运行配置、安装脚本和使用说明；不需要 Python、Node 或 Codex。
 
@@ -20,6 +20,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 2. 点击“登录 GitHub”，通过 Git Credential Manager 在浏览器完成登录。应用不要求你填写或保存 PAT。
 3. 点击“立即备份”完成第一份备份，也可等待计划检查。
 4. “设置”中可以更换仓库、调整间隔、编辑排除规则、关闭登录自启。
+
+备份运行时，“立即备份”会变为“停止备份”，点击后停止本轮；也可在托盘菜单选择“停止本轮备份”。停止过程中按钮显示“正在停止…”，完成后可以再次备份。扫描和复制会尽快停止；若正在创建提交或整理 Git 历史，会等待当前步骤安全完成。提交前停止会恢复原快照，已完成的提交不会丢失，未推送提交在下次备份时补传。停止本轮不会更改自动计划的暂停设置，下一次自动检查从本轮结束后按原间隔计算。
 
 在列表的“GitHub 目录名”栏双击编辑，按回车保存，Esc 取消。支持中文和空格；名称须为 1–80 个字符，不能包含路径分隔符、系统保留名，也不能与其他任务重名（包括停用任务）。改名后点击“立即备份”或等待下次计划检查，云端目录才会迁移。
 

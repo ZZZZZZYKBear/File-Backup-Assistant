@@ -212,6 +212,67 @@ namespace CloudBackup {
                 Assert(git.Must(cache, "for-each-ref", "--format=%(objectname)", "refs/backup-recovery/").Contains(pendingHead), "Conflict recovery lost pending commit.");
                 Assert(engine.Backup(settings).Pushed && git.Must(root, "--git-dir", remote, "show", "HEAD:" + settings.Folders[1].Target + "/new.txt") == "local-conflict", "Explicit conflict recovery failed.");
                 passed.Add("explicit conflict recovery retains old commit and resumes backup");
+                string cancelRemoteHead = git.Must(root, "--git-dir", remote, "rev-parse", "HEAD");
+                File.WriteAllText(Path.Combine(source, "中文.txt"), "cancel-before-commit");
+                foreach (string phaseToCancel in new[] { "after-file-copy:中文.txt", "before-add", "before-commit" }) {
+                    using (var stop = new System.Threading.CancellationTokenSource()) {
+                        engine.FaultForTests = delegate(string phase) { if (phase == phaseToCancel) stop.Cancel(); };
+                        bool cancelled = false;
+                        try { engine.Backup(settings, stop.Token); } catch (OperationCanceledException) { cancelled = true; }
+                        finally { engine.FaultForTests = null; }
+                        Assert(cancelled && git.Must(root, "--git-dir", remote, "rev-parse", "HEAD") == cancelRemoteHead &&
+                            git.Must(cache, "status", "--porcelain") == "" && Directory.GetDirectories(Path.Combine(store.Root, "staging")).Length == 0,
+                            "Cancellation did not roll back safely at " + phaseToCancel);
+                    }
+                }
+                passed.Add("stopping during copy, after snapshot application and before commit restores files and index");
+                using (var stop = new System.Threading.CancellationTokenSource()) {
+                    engine.FaultForTests = delegate(string phase) { if (phase == "after-commit") stop.Cancel(); };
+                    bool cancelled = false; try { engine.Backup(settings, stop.Token); } catch (OperationCanceledException) { cancelled = true; }
+                    finally { engine.FaultForTests = null; }
+                    Assert(cancelled && git.Must(cache, "rev-parse", "HEAD") != cancelRemoteHead &&
+                        git.Must(root, "--git-dir", remote, "rev-parse", "HEAD") == cancelRemoteHead && git.Must(cache, "status", "--porcelain") == "",
+                        "Stopping after commit discarded a durable commit or pushed it unexpectedly.");
+                }
+                RunResult afterStop = engine.Backup(settings);
+                Assert(afterStop.Pushed && !afterStop.Changed, "Stopped backup's durable commit did not retry without duplication.");
+                File.WriteAllText(Path.Combine(source, "中文.txt"), "healthy-with-lock"); engine.Backup(settings);
+                passed.Add("stopping after commit preserves the commit and next backup uploads it exactly once");
+                string oldGitExe = Environment.GetEnvironmentVariable("BACKUP_GIT_EXE"), oldSlowDir = Environment.GetEnvironmentVariable("BACKUP_CANCEL_TEST_DIR");
+                string slowRoot = Path.Combine(root, "slow-network"), slowMarker = Path.Combine(slowRoot, "processes.txt"); Directory.CreateDirectory(slowRoot);
+                Directory.CreateDirectory(Path.Combine(slowRoot, ".git", "refs", "remotes", "origin"));
+                File.WriteAllText(Path.Combine(slowRoot, ".git", "packed-refs.lock"), "pre-existing-lock");
+                string testExecutable = Path.Combine(Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName), "BackupTests.exe");
+                Assert(File.Exists(testExecutable), "Network cancellation test requires the built BackupTests.exe.");
+                List<int> slowPids = new List<int>();
+                using (var stop = new System.Threading.CancellationTokenSource()) {
+                    System.Threading.Tasks.Task<GitResult> network = null;
+                    try {
+                        Environment.SetEnvironmentVariable("BACKUP_GIT_EXE", testExecutable); Environment.SetEnvironmentVariable("BACKUP_CANCEL_TEST_DIR", slowRoot);
+                        Git slowGit = new Git(slowRoot) { NetworkCancellation = stop.Token };
+                        network = System.Threading.Tasks.Task.Run(() => slowGit.Run(slowRoot, "fetch", "origin"));
+                        Stopwatch wait = Stopwatch.StartNew();
+                        while (!File.Exists(slowMarker) && !network.IsCompleted && wait.ElapsedMilliseconds < 10000) System.Threading.Thread.Sleep(50);
+                        Assert(File.Exists(slowMarker), "Slow network test did not start.");
+                        slowPids.AddRange(File.ReadAllText(slowMarker).Split(' ').Select(Int32.Parse)); stop.Cancel();
+                        Assert(System.Threading.Tasks.Task.WhenAny(network, System.Threading.Tasks.Task.Delay(15000)).GetAwaiter().GetResult() == network, "Network cancellation timed out.");
+                        bool cancelled = false; try { network.GetAwaiter().GetResult(); } catch (OperationCanceledException) { cancelled = true; }
+                        Assert(cancelled, "Running network operation did not cancel.");
+                        Assert(!File.Exists(Path.Combine(slowRoot, ".git", "refs", "remotes", "origin", "main.lock")) &&
+                            File.ReadAllText(Path.Combine(slowRoot, ".git", "packed-refs.lock")) == "pre-existing-lock", "Cancelled network command left its new lock or removed a pre-existing lock.");
+                        foreach (int pid in slowPids) {
+                            bool alive = false; try { using (Process p = Process.GetProcessById(pid)) alive = !p.HasExited; } catch (ArgumentException) { }
+                            Assert(!alive, "Network cancellation left a child process alive.");
+                        }
+                    } finally {
+                        stop.Cancel(); if (network != null) { try { network.Wait(15000); } catch (AggregateException) { } }
+                        Environment.SetEnvironmentVariable("BACKUP_GIT_EXE", oldGitExe); Environment.SetEnvironmentVariable("BACKUP_CANCEL_TEST_DIR", oldSlowDir);
+                        foreach (int pid in slowPids) {
+                            try { using (Process p = Process.GetProcessById(pid)) if (!p.HasExited && pid != Process.GetCurrentProcess().Id && Paths.Equal(p.MainModule.FileName, testExecutable)) { p.Kill(); p.WaitForExit(3000); } } catch (ArgumentException) { }
+                        }
+                    }
+                }
+                passed.Add("stopping a running network operation terminates only its own process tree");
                 Settings legacy = Json.Read<Settings>(Json.Write(new { Repository = remote, Folders = new[] { new { Id = settings.Folders[0].Id, Name = "legacy", Source = source, Enabled = true } } }));
                 Assert(legacy.Folders[0].GitHubName == null && legacy.Folders[0].Target == "backups/" + settings.Folders[0].Id, "Old settings changed destination on load.");
                 passed.Add("legacy settings retain their original cloud directory");
@@ -275,9 +336,27 @@ namespace CloudBackup {
                     table.BeginEdit(true); ((System.Windows.Forms.TextBox)table.EditingControl).Text = "../invalid";
                     table.EndEdit(); System.Windows.Forms.Application.DoEvents();
                     Assert(uiStore.Load().Folders[0].GitHubName == "UI 中文目录" && Convert.ToString(table.Rows[0].Cells[4].Value) == "UI 中文目录", "UI accepted invalid destination.");
-                    table.CancelEdit(); form.ForceExit();
+                    table.CancelEdit();
+                    var privateFlags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+                    var cancelField = typeof(MainForm).GetField("backupCancellation", privateFlags);
+                    var busyMethod = typeof(MainForm).GetMethod("SetBusy", privateFlags);
+                    var backupButton = (System.Windows.Forms.Button)typeof(MainForm).GetField("backupButton", privateFlags).GetValue(form);
+                    using (var stop = new System.Threading.CancellationTokenSource()) {
+                        cancelField.SetValue(form, stop); busyMethod.Invoke(form, new object[] { true });
+                        Assert(backupButton.Enabled && backupButton.Text == "停止备份", "Stop button disabled during backup.");
+                        backupButton.PerformClick(); typeof(MainForm).GetMethod("RequestStop", privateFlags).Invoke(form, null);
+                        Assert(stop.IsCancellationRequested && !backupButton.Enabled && backupButton.Text == "正在停止…" &&
+                            (bool)typeof(MainForm).GetField("busy", privateFlags).GetValue(form), "Stop request unlocked the form before worker completion.");
+                        Assert(!uiStore.Load().Paused, "Stopping a backup changed the saved automatic schedule.");
+                        cancelField.SetValue(form, null); busyMethod.Invoke(form, new object[] { false });
+                        Assert(backupButton.Enabled && backupButton.Text == "立即备份", "Stop completion did not restore backup button.");
+                    }
+                    busyMethod.Invoke(form, new object[] { true });
+                    Assert(!backupButton.Enabled && backupButton.Text == "立即备份", "Non-backup operations incorrectly allow stopping.");
+                    busyMethod.Invoke(form, new object[] { false }); form.ForceExit();
                 }
                 passed.Add("editable cloud-name column saves valid input and blocks invalid input");
+                passed.Add("stop button remains available during backup, prevents double cancellation and waits for worker completion");
                 Store removeStore = new Store(Path.Combine(root, "remove-preview"));
                 using (MainForm form = new MainForm(removeStore, false, true)) {
                     form.ShowInTaskbar = false; form.Opacity = 0; form.Show(); System.Windows.Forms.Application.DoEvents();
@@ -307,6 +386,17 @@ namespace CloudBackup {
     }
     public static class TestRunner {
         [STAThread]
-        public static int Main(string[] args) { return SelfTests.Run(args.Length > 0 ? args[0] : Environment.CurrentDirectory); }
+        public static int Main(string[] args) {
+            if (args.Contains("--cancel-test-child")) { System.Threading.Thread.Sleep(60000); return 0; }
+            string slowRoot = Environment.GetEnvironmentVariable("BACKUP_CANCEL_TEST_DIR");
+            if (slowRoot != null && args.Contains("fetch")) {
+                File.WriteAllText(Path.Combine(slowRoot, ".git", "refs", "remotes", "origin", "main.lock"), "interrupted-network-lock");
+                using (Process child = Process.Start(new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--cancel-test-child") { UseShellExecute = false, CreateNoWindow = true })) {
+                    File.WriteAllText(Path.Combine(slowRoot, "processes.txt"), Process.GetCurrentProcess().Id + " " + child.Id);
+                    System.Threading.Thread.Sleep(60000); return 0;
+                }
+            }
+            return SelfTests.Run(args.Length > 0 ? args[0] : Environment.CurrentDirectory);
+        }
     }
 }

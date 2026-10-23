@@ -223,8 +223,11 @@ namespace CloudBackup {
     }
     public sealed class Git {
         public readonly string Executable;
+        public CancellationToken NetworkCancellation;
         readonly string hooks;
+        readonly string root;
         public Git(string root) {
+            this.root = Paths.Full(root);
             hooks = Path.Combine(root, "empty-hooks"); Directory.CreateDirectory(hooks);
             string[] guesses = {
                 Environment.GetEnvironmentVariable("BACKUP_GIT_EXE"),
@@ -251,6 +254,9 @@ namespace CloudBackup {
         }
         public GitResult Run(string cwd, params string[] args) { return Run(cwd, false, args); }
         public GitResult Run(string cwd, bool interactive, params string[] args) {
+            bool cancellable = !interactive && args.Length > 0 && new[] { "clone", "fetch", "push", "ls-remote" }.Contains(args[0]);
+            if (cancellable) NetworkCancellation.ThrowIfCancellationRequested();
+            HashSet<string> existingLocks = cancellable ? NetworkLocks(cwd) : null;
             List<string> options = new List<string> { "-c", "core.hooksPath=" + hooks, "-c", "core.quotePath=false" };
             if (!interactive) options.AddRange(new[] { "-c", "credential.interactive=never" });
             options.AddRange(args);
@@ -266,17 +272,64 @@ namespace CloudBackup {
             using (Process process = Process.Start(info)) {
                 Task<string> stdout = process.StandardOutput.ReadToEndAsync();
                 Task<string> stderr = process.StandardError.ReadToEndAsync();
-                if (!process.WaitForExit(interactive ? 300000 : 180000)) {
-                    try {
-                        string killer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "taskkill.exe");
-                        using (Process kill = Process.Start(new ProcessStartInfo(killer, "/PID " + process.Id + " /T /F") { UseShellExecute = false, CreateNoWindow = true })) kill.WaitForExit(10000);
-                        process.WaitForExit(10000);
-                    } catch { try { process.Kill(); process.WaitForExit(10000); } catch { } }
-                    throw new IOException("Git 操作超时。网络恢复后可重试，已有提交会保留。");
+                Stopwatch elapsed = Stopwatch.StartNew();
+                while (!process.WaitForExit(200)) {
+                    if (cancellable && NetworkCancellation.IsCancellationRequested) {
+                        StopProcessTree(process);
+                        Task.WaitAll(new Task[] { stdout, stderr }, 10000);
+                        ClearNewNetworkLocks(cwd, existingLocks);
+                        NetworkCancellation.ThrowIfCancellationRequested();
+                    }
+                    if (elapsed.ElapsedMilliseconds > (interactive ? 300000 : 180000)) {
+                        StopProcessTree(process);
+                        throw new IOException("Git 操作超时。网络恢复后可重试，已有提交会保留。");
+                    }
                 }
                 Task.WaitAll(stdout, stderr);
+                if (cancellable) NetworkCancellation.ThrowIfCancellationRequested();
                 return new GitResult { Code = process.ExitCode, Text = Store.Sanitize(stdout.Result + stderr.Result) };
             }
+        }
+        static void StopProcessTree(Process process) {
+            if (process.HasExited) return;
+            try {
+                string killer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "taskkill.exe");
+                using (Process kill = Process.Start(new ProcessStartInfo(killer, "/PID " + process.Id + " /T /F") { UseShellExecute = false, CreateNoWindow = true })) kill.WaitForExit(10000);
+            } catch { if (!process.HasExited) process.Kill(); }
+            if (!process.WaitForExit(10000)) throw new IOException("Git 进程尚未退出，请稍后重试；已有提交已保留。");
+        }
+        HashSet<string> NetworkLocks(string cwd) {
+            var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string gitDir = Path.Combine(cwd, ".git");
+            if (!Paths.Inside(gitDir, root) || !Directory.Exists(gitDir)) return paths;
+            Paths.Child(gitDir, root);
+            foreach (string relative in new[] { "packed-refs.lock", "FETCH_HEAD.lock", "shallow.lock", "objects/pack/multi-pack-index.lock", "objects/info/commit-graph.lock" }) {
+                string path = Path.Combine(gitDir, relative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(path, root);
+                if (File.Exists(path)) paths.Add(path);
+            }
+            var pending = new Queue<string>(); pending.Enqueue(Path.Combine(gitDir, "refs"));
+            while (pending.Count > 0) {
+                string directory = pending.Dequeue();
+                if (!Directory.Exists(directory)) continue;
+                Paths.Child(directory, root);
+                foreach (string file in Directory.GetFiles(directory, "*.lock")) { Paths.Child(file, root); paths.Add(file); }
+                foreach (string child in Directory.GetDirectories(directory)) {
+                    if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0) pending.Enqueue(child);
+                }
+            }
+            return paths;
+        }
+        void ClearNewNetworkLocks(string cwd, HashSet<string> existing) {
+            // Never remove another Git process's lock or a pre-existing lock.
+            bool gitRunning = false;
+            foreach (Process process in Process.GetProcesses()) {
+                try { string name = process.ProcessName; if (name.Equals("git", StringComparison.OrdinalIgnoreCase) || name.StartsWith("git-", StringComparison.OrdinalIgnoreCase)) gitRunning = true; }
+                catch (System.ComponentModel.Win32Exception) { gitRunning = true; }
+                catch (InvalidOperationException) { } // Process exited during enumeration.
+                finally { process.Dispose(); }
+            }
+            if (gitRunning) return;
+            foreach (string path in NetworkLocks(cwd)) if (!existing.Contains(path)) { Paths.Child(path, root); File.Delete(path); }
         }
         public string Must(string cwd, params string[] args) {
             GitResult result = Run(cwd, args);
@@ -320,6 +373,8 @@ namespace CloudBackup {
     }
     public sealed class Engine {
         readonly Store store; readonly Git git;
+        CancellationToken cancellation;
+        void CheckStopped() { cancellation.ThrowIfCancellationRequested(); }
         public bool AllowLocalRemoteForTests;
         public Action<string> FaultForTests;
         public Action<string> Progress;
@@ -363,6 +418,7 @@ namespace CloudBackup {
             }
         }
         public Snapshot Capture(FolderJob job, string stage, string exclusions) {
+            CheckStopped();
             Paths.Source(job.Source, store.Root);
             Paths.Child(stage, store.Root);
             Snapshot snapshot = new Snapshot { Path = stage };
@@ -371,6 +427,7 @@ namespace CloudBackup {
             return snapshot;
         }
         void CaptureDirectory(string source, string target, string relative, string exclusions, Snapshot snapshot) {
+            CheckStopped();
             string[] entries;
             try {
                 if ((ReadSource(() => File.GetAttributes(source)) & FileAttributes.ReparsePoint) != 0) { snapshot.Skipped++; return; }
@@ -378,6 +435,7 @@ namespace CloudBackup {
             } catch (SourceUnavailableException error) { SkipEntry(snapshot, relative, error.Message, true); return; }
             snapshot.Directories.Add(relative);
             foreach (string entry in entries) {
+                CheckStopped();
                 string name = Path.GetFileName(entry), rel = relative == "" ? name : relative + "/" + name;
                 if (Excluded(name, exclusions)) { snapshot.Skipped++; continue; }
                 FileAttributes attributes;
@@ -399,6 +457,7 @@ namespace CloudBackup {
                         using (FileStream output = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None)) {
                             byte[] buffer = new byte[65536]; long copied = 0; int count;
                             while ((count = ReadSource(() => input.Read(buffer, 0, buffer.Length))) > 0) {
+                                CheckStopped();
                                 copied += count;
                                 if (copied >= 100L * 1024 * 1024) throw new FileRejectedException("单文件达到 100 MiB");
                                 output.Write(buffer, 0, count);
@@ -418,6 +477,7 @@ namespace CloudBackup {
             }
         }
         T ReadSource<T>(Func<T> read) {
+            CheckStopped();
             try { return read(); }
             catch (IOException) { throw new SourceUnavailableException(); }
             catch (UnauthorizedAccessException) { throw new SourceUnavailableException(); }
@@ -567,6 +627,7 @@ namespace CloudBackup {
             string path = Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)); Paths.Child(path, root); return path;
         }
         void PreserveEntry(string previous, string target, string relative, string exclusions, Snapshot snapshot) {
+            CheckStopped();
             Paths.Child(previous, store.Root);
             if (!File.Exists(previous) && !Directory.Exists(previous)) return;
             if (relative.Split('/').Any(p => Excluded(p, exclusions))) return;
@@ -664,6 +725,15 @@ namespace CloudBackup {
             return true;
         }
         public RunResult Backup(Settings settings) {
+            return Backup(settings, CancellationToken.None);
+        }
+        public RunResult Backup(Settings settings, CancellationToken token) {
+            cancellation = token; git.NetworkCancellation = token;
+            try { return BackupCore(settings); }
+            finally { cancellation = CancellationToken.None; git.NetworkCancellation = CancellationToken.None; }
+        }
+        RunResult BackupCore(Settings settings) {
+            CheckStopped();
             string remote = AllowLocalRemoteForTests ? settings.Repository : ValidateRemote(settings.Repository);
             CloudNames.ValidateJobs(settings.Folders);
             List<FolderJob> jobs = settings.Folders.Where(j => j.Enabled).ToList();
@@ -675,21 +745,27 @@ namespace CloudBackup {
             Report("检查仓库和待上传提交…");
             string repo = EnsureRepo(remote);
             RecoverTransactions(repo);
+            CheckStopped();
             string branch = git.Must(repo, "symbolic-ref", "--short", "HEAD");
             Reconcile(repo, branch);
+            CheckStopped();
             bool pushed = PushPending(repo, branch);
             string stageRoot = Path.Combine(store.Root, "staging", Guid.NewGuid().ToString("N"));
             List<Snapshot> snapshots = new List<Snapshot>();
             try {
                 foreach (FolderJob job in jobs) {
                     Report("扫描目录：" + job.Name);
+                    CheckStopped();
                     snapshots.Add(Capture(job, Path.Combine(stageRoot, job.Id), settings.Exclusions));
                 }
+                CheckStopped();
                 SnapshotJournal journal = PrepareJournal(repo, stageRoot, jobs, snapshots, settings.Exclusions);
                 bool changed;
                 try {
+                    CheckStopped();
                     ApplyJournal(journal);
                     if (FaultForTests != null) FaultForTests("before-add");
+                    CheckStopped();
                     // Windows resolves the old casing to the new directory, so
                     // add -A alone cannot notice that the old index path vanished.
                     // The journal already saved the index for rollback.
@@ -704,6 +780,7 @@ namespace CloudBackup {
                     if (changed) {
                         Report("发现内容变化，正在创建备份提交…");
                         if (FaultForTests != null) FaultForTests("before-commit");
+                        CheckStopped();
                         git.Must(repo, "commit", "-m", "Backup " + DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss zzz") + " (" + jobs.Count + " folders)");
                     }
                 } catch {
@@ -713,6 +790,8 @@ namespace CloudBackup {
                 // The commit is durable (or the snapshot was unchanged). A later
                 // push failure must keep this commit, never roll it back.
                 Paths.DeleteTree(stageRoot, store.Root);
+                if (FaultForTests != null) FaultForTests("after-commit");
+                CheckStopped();
                 if (changed) pushed = PushPending(repo, branch) || pushed;
                 int skipped = snapshots.Sum(s => s.Skipped);
                 int warnings = snapshots.Sum(s => s.Warnings.Count);

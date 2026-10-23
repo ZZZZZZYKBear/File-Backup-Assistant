@@ -58,6 +58,9 @@ namespace CloudBackup {
         readonly ProgressBar progress = new ProgressBar();
         readonly List<Button> actions = new List<Button>();
         readonly Button pause = new Button();
+        Button backupButton;
+        ToolStripMenuItem stopBackupMenu;
+        CancellationTokenSource backupCancellation;
         readonly NotifyIcon tray = new NotifyIcon();
         readonly System.Windows.Forms.Timer clock = new System.Windows.Forms.Timer();
         bool busy, exiting, exitWhenDone, loadingGrid, hideTip;
@@ -134,7 +137,8 @@ namespace CloudBackup {
             FlowLayoutPanel toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
             toolbar.Controls.Add(ButtonText("＋ 添加目录", delegate { AddFolder(); }, true));
             toolbar.Controls.Add(ButtonText("移除选中", delegate { RemoveFolder(); }, false));
-            toolbar.Controls.Add(ButtonText("立即备份", async delegate { await Backup(); }, false));
+            backupButton = ButtonText("立即备份", async delegate { if (backupCancellation != null) RequestStop(); else await Backup(); }, false);
+            toolbar.Controls.Add(backupButton);
             pause.Text = "暂停计划"; pause.AutoSize = true; pause.MinimumSize = new Size(98, 35); pause.FlatStyle = FlatStyle.Flat; pause.BackColor = Color.White; pause.FlatAppearance.BorderColor = Color.FromArgb(218, 224, 234);
             pause.Click += delegate { TogglePause(); }; actions.Add(pause); toolbar.Controls.Add(pause);
             toolbar.Controls.Add(ButtonText("登录 GitHub", async delegate { await Background("请在浏览器中完成 GitHub 登录…", delegate { engine.Login(); return "GitHub 登录已完成，可点击立即备份。"; }); }, false));
@@ -206,6 +210,8 @@ namespace CloudBackup {
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add("打开助手", null, delegate { Restore(); });
             menu.Items.Add("立即备份", null, async delegate { await Backup(); });
+            stopBackupMenu = new ToolStripMenuItem("停止本轮备份", null, delegate { RequestStop(); }); stopBackupMenu.Enabled = false;
+            menu.Items.Add(stopBackupMenu);
             menu.Items.Add("暂停 / 继续计划", null, delegate { TogglePause(); });
             menu.Items.Add("打开日志", null, delegate { Directory.CreateDirectory(Path.GetDirectoryName(store.LogFile)); Open(Path.GetDirectoryName(store.LogFile)); });
             menu.Items.Add(new ToolStripSeparator()); menu.Items.Add("退出助手", null, delegate { Exit(); });
@@ -246,7 +252,19 @@ namespace CloudBackup {
             if (logs.TextLength > 60000) logs.Text = logs.Text.Substring(logs.TextLength - 40000);
             logs.SelectionStart = logs.TextLength; logs.ScrollToCaret();
         }
-        void SetBusy(bool value) { busy = value; foreach (Button button in actions) button.Enabled = !value; grid.ReadOnly = value; progress.Visible = value; }
+        void SetBusy(bool value) {
+            busy = value; foreach (Button button in actions) button.Enabled = !value; grid.ReadOnly = value; progress.Visible = value;
+            bool canStop = backupCancellation != null && !backupCancellation.IsCancellationRequested;
+            backupButton.Text = backupCancellation == null ? "立即备份" : canStop ? "停止备份" : "正在停止…";
+            if (backupCancellation != null) backupButton.Enabled = canStop;
+            if (stopBackupMenu != null) stopBackupMenu.Enabled = canStop;
+        }
+        void RequestStop() {
+            if (backupCancellation == null || backupCancellation.IsCancellationRequested) return;
+            backupCancellation.Cancel(); SetBusy(true);
+            const string message = "正在停止本轮备份…若正在创建提交或整理历史，会在该步骤完成后停止。";
+            Report(message); store.Log(message);
+        }
         async Task Background(string message, Func<string> operation) {
             if (busy) return; if (engine == null) { MessageBox.Show("未找到 Git for Windows，请安装后重启助手。"); return; }
             SetBusy(true); Report(message);
@@ -258,11 +276,12 @@ namespace CloudBackup {
             if (busy) return;
             if (!grid.EndEdit()) return;
             if (engine == null || !settings.Folders.Any(j => j.Enabled)) { Report("请先添加并启用目录，并确认已安装 Git。"); return; }
-            Settings snapshot = settings.Copy(); SetBusy(true);
+            Settings snapshot = settings.Copy(); backupCancellation = new CancellationTokenSource(); SetBusy(true);
             foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) job.Status = "检查中…";
             RefreshGrid();
             try {
-                RunResult result = await Task.Run(delegate { return engine.Backup(snapshot); });
+                CancellationToken token = backupCancellation.Token;
+                RunResult result = await Task.Run(delegate { return engine.Backup(snapshot, token); });
                 foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) {
                     int warnings; result.JobWarnings.TryGetValue(job.Id, out warnings);
                     job.Status = result.Changed || result.Pushed ? "备份已推送" : "内容未变化";
@@ -271,11 +290,16 @@ namespace CloudBackup {
                 }
                 if (result.Pushed) settings.LastPush = DateTime.Now.ToString("MM-dd HH:mm");
                 Report(result.Message);
+            } catch (OperationCanceledException) {
+                const string message = "本轮备份已停止。已完成的提交保留，未推送的提交可在下次备份补传；自动计划保持原设置。";
+                Report(message); store.Log(message);
+                foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) { job.Status = "本轮已停止"; job.LastCheck = DateTime.Now.ToString("MM-dd HH:mm:ss"); }
             } catch (Exception error) {
                 string message = Store.Sanitize(error.Message); Report(message); store.Log(message);
                 foreach (FolderJob job in settings.Folders.Where(j => j.Enabled)) { job.Status = "本轮失败 · 查看日志"; job.LastCheck = DateTime.Now.ToString("MM-dd HH:mm:ss"); }
                 if (!Visible) tray.ShowBalloonTip(4000, "备份未完成", message.Substring(0, Math.Min(220, message.Length)), ToolTipIcon.Warning);
             } finally {
+                backupCancellation.Dispose(); backupCancellation = null;
                 settings.NextRunUtc = DateTime.UtcNow.AddMinutes(settings.IntervalMinutes).ToString("o");
                 try { store.Save(settings); }
                 catch (Exception error) { Report("备份状态未能保存，下次启动将重新检查：" + error.Message); }
